@@ -181,6 +181,25 @@ inline void applyChromiumFlags(const ChromiumFlagConfig& config,
     }
 }
 
+// Parse a top-level boolean "disableGPU" key from build.json content.
+inline bool parseDisableGPU(const std::string& json) {
+    std::string key = "\"disableGPU\"";
+    size_t keyPos = json.find(key);
+    if (keyPos == std::string::npos) return false;
+
+    size_t colon = json.find(':', keyPos + key.length());
+    if (colon == std::string::npos) return false;
+
+    size_t valStart = colon + 1;
+    while (valStart < json.size() &&
+           (json[valStart] == ' ' || json[valStart] == '\t' ||
+            json[valStart] == '\n' || json[valStart] == '\r')) {
+        valStart++;
+    }
+    // Check for "true" token
+    return json.compare(valStart, 4, "true") == 0;
+}
+
 } // namespace electrobun
 
 #endif // ELECTROBUN_CHROMIUM_FLAGS_H

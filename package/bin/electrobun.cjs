@@ -20,16 +20,16 @@ function getPlatform() {
 }
 
 function getArch() {
+  // Always use x64 since we only build x64 binaries
   switch (process.arch) {
-    case 'arm64': return 'arm64';
+    case 'arm64':
     case 'x64': return 'x64';
     default: throw new Error(`Unsupported architecture: ${process.arch}`);
   }
 }
 
 const platform = getPlatform();
-// Always use x64 for Windows since we only build x64 Windows binaries
-const arch = platform === 'win' ? 'x64' : getArch();
+const arch = getArch();
 const binExt = platform === 'win' ? '.exe' : '';
 
 // Paths

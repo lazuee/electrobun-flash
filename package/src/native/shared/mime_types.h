@@ -93,6 +93,11 @@ inline std::string getMimeTypeFromUrl(const std::string& url) {
         return "application/gzip";
     }
 
+    // shockwave flash files
+    else if (url.find(".swf") != std::string::npos) {
+        return "application/x-shockwave-flash";
+    }
+
     return "application/octet-stream"; // default
 }
 

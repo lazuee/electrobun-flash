@@ -152,6 +152,8 @@ export default {
 				"views/playgrounds/webview-cleanup/assets/bunny.png",
 			"src/playgrounds/wgpu-tag/index.html":
 				"views/playgrounds/wgpu-tag/index.html",
+			"src/playgrounds/gpu-disabled/index.html":
+				"views/playgrounds/gpu-disabled/index.html",
 		},
 		mac: {
 			codesign: true,

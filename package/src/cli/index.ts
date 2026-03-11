@@ -33,6 +33,7 @@ import {
 	getMacOSBundleDisplayName,
 } from "../shared/naming";
 import { getTemplate, getTemplateNames } from "./templates/embedded";
+import type { ElectrobunConfig } from "../bun";
 // import { loadBsdiff, loadBspatch } from 'bsdiff-wasm';
 // MacOS named pipes hang at around 4KB
 // @ts-expect-error - reserved for future use
@@ -97,7 +98,7 @@ const ELECTROBUN_CACHE_PATH = join(dirname(ELECTROBUN_DEP_PATH), ".electrobun-ca
 // Function to get platform-specific paths
 function getPlatformPaths(
 	targetOS: "macos" | "win" | "linux",
-	targetArch: "arm64" | "x64",
+	targetArch: "x64",
 ) {
 	const binExt = targetOS === "win" ? ".exe" : "";
 	const platformDistDir = join(
@@ -143,7 +144,7 @@ const _PATHS = getPlatformPaths(OS, ARCH);
 
 async function ensureCoreDependencies(
 	targetOS?: "macos" | "win" | "linux",
-	targetArch?: "arm64" | "x64",
+	targetArch?: "x64",
 ) {
 	// Use provided target platform or default to host platform
 	const platformOS = targetOS || OS;
@@ -365,7 +366,7 @@ async function ensureCoreDependencies(
  */
 function getEffectiveCEFDir(
 	platformOS: "macos" | "win" | "linux",
-	platformArch: "arm64" | "x64",
+	platformArch: "x64",
 	cefVersion?: string,
 ): string {
 	if (cefVersion) {
@@ -480,7 +481,7 @@ async function trimICUData(
  */
 async function ensureBunBinary(
 	targetOS: "macos" | "win" | "linux",
-	targetArch: "arm64" | "x64",
+	targetArch: "x64",
 	bunVersion?: string,
 ): Promise<string> {
 	if (!bunVersion) {
@@ -666,7 +667,7 @@ async function downloadCustomBun(
 
 async function ensureCEFDependencies(
 	targetOS?: "macos" | "win" | "linux",
-	targetArch?: "arm64" | "x64",
+	targetArch?: "x64",
 	cefVersion?: string,
 ): Promise<string> {
 	// Use provided target platform or default to host platform
@@ -1146,7 +1147,7 @@ async function ensureWGPUDependencies(
 async function downloadAndExtractCustomCEF(
 	cefVersion: string,
 	platformOS: "macos" | "win" | "linux",
-	platformArch: "arm64" | "x64",
+	platformArch: "x64",
 ) {
 	// Parse "CEF_VERSION+chromium-CHROMIUM_VERSION"
 	const match = cefVersion.match(/^(.+)\+chromium-(.+)$/);
@@ -1162,12 +1163,9 @@ async function downloadAndExtractCustomCEF(
 
 	// Map platform names to Spotify CDN naming
 	const cefPlatformMap: Record<string, string> = {
-		"macos-arm64": "macosarm64",
 		"macos-x64": "macosx64",
 		"win-x64": "windows64",
-		"win-arm64": "windowsarm64",
 		"linux-x64": "linux64",
-		"linux-arm64": "linuxarm64",
 	};
 	const cefPlatform = cefPlatformMap[`${platformOS}-${platformArch}`];
 	if (!cefPlatform) {
@@ -1361,6 +1359,7 @@ const defaultConfig = {
 		mac: {
 			codesign: false,
 			notarize: false,
+			disableGPU: false,
 			bundleCEF: false,
 			bundleWGPU: false,
 			entitlements: {
@@ -1375,6 +1374,7 @@ const defaultConfig = {
 			chromiumFlags: undefined as Record<string, string | boolean> | undefined,
 		},
 		win: {
+			disableGPU: false,
 			bundleCEF: false,
 			bundleWGPU: false,
 			icon: undefined as string | undefined,
@@ -1382,6 +1382,7 @@ const defaultConfig = {
 			chromiumFlags: undefined as Record<string, string | boolean> | undefined,
 		},
 		linux: {
+			disableGPU: false,
 			bundleCEF: false,
 			bundleWGPU: false,
 			icon: undefined as string | undefined,
@@ -1409,7 +1410,7 @@ const defaultConfig = {
 		baseUrl: "",
 		generatePatch: true,
 	},
-};
+}
 
 // Mapping of entitlements to their corresponding Info.plist usage description keys
 const ENTITLEMENT_TO_PLIST_KEY: Record<string, string> = {
@@ -2718,6 +2719,38 @@ Categories=Utility;Application;
 			dereference: true,
 		});
 
+		// Copy PepperFlash plugin for PPAPI Flash support
+		const hasCEF =
+			(targetOS === "macos" && config.build.mac?.bundleCEF) ||
+			(targetOS === "win" && config.build.win?.bundleCEF) ||
+			(targetOS === "linux" && config.build.linux?.bundleCEF);
+		if (hasCEF) {
+			const pepperFlashVendorDir = join(ELECTROBUN_DEP_PATH, "vendors", "pepper-flash");
+			if (targetOS === "macos") {
+				const flashSource = join(pepperFlashVendorDir, "PepperFlashPlayer.plugin");
+				if (existsSync(flashSource)) {
+					cpSync(flashSource, join(appBundleMacOSPath, "PepperFlashPlayer.plugin"), {
+						recursive: true,
+						dereference: true,
+					});
+				}
+			} else if (targetOS === "linux") {
+				const flashSource = join(pepperFlashVendorDir, "libpepflashplayer.so");
+				if (existsSync(flashSource)) {
+					cpSync(flashSource, join(appBundleMacOSPath, "libpepflashplayer.so"), {
+						dereference: true,
+					});
+				}
+			} else if (targetOS === "win") {
+				const flashSource = join(pepperFlashVendorDir, "pepflashplayer.dll");
+				if (existsSync(flashSource)) {
+					cpSync(flashSource, join(appBundleMacOSPath, "pepflashplayer.dll"), {
+						dereference: true,
+					});
+				}
+			}
+		}
+
 		// Copy libasar dynamic library for ASAR support
 		const libExt =
 			targetOS === "win" ? ".dll" : targetOS === "macos" ? ".dylib" : ".so";
@@ -3120,6 +3153,10 @@ Categories=Utility;Application;
 			Object.keys(platformConfig.chromiumFlags).length > 0
 		) {
 			buildJsonObj["chromiumFlags"] = platformConfig.chromiumFlags;
+		}
+
+		if (platformConfig?.disableGPU) {
+			buildJsonObj["disableGPU"] = true;
 		}
 
 		const buildJsonContent = JSON.stringify(buildJsonObj);
@@ -3763,7 +3800,6 @@ Categories=Utility;Application;
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		let mainProc: any;
 		let bundleExecPath: string;
-		// @ts-expect-error - reserved for future use
 		let _bundleResourcesPath: string;
 		if (OS === "macos") {
 			bundleExecPath = join(buildFolder, bundleFileName, "Contents", "MacOS");

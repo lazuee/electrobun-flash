@@ -219,6 +219,13 @@ export interface ElectrobunConfig {
 			chromiumFlags?: Record<string, string | boolean>;
 
 			/**
+			 * Disable GPU acceleration for all CEF webviews.
+			 * Appends --disable-gpu and related switches before CEF initialization.
+			 * @default false
+			 */
+			disableGPU?: boolean;
+
+			/**
 			 * macOS entitlements for code signing
 			 */
 			entitlements?: Record<string, boolean | string | string[]>;
@@ -270,6 +277,13 @@ export interface ElectrobunConfig {
 			chromiumFlags?: Record<string, string | boolean>;
 
 			/**
+			 * Disable GPU acceleration for all CEF webviews.
+			 * Appends --disable-gpu and related switches before CEF initialization.
+			 * @default false
+			 */
+			disableGPU?: boolean;
+
+			/**
 			 * Path to application icon (.ico format)
 			 * Used for the installer/extractor wrapper, desktop shortcuts, and taskbar
 			 * Should include multiple sizes (16x16, 32x32, 48x48, 256x256) for best results
@@ -317,6 +331,13 @@ export interface ElectrobunConfig {
 			 * ```
 			 */
 			chromiumFlags?: Record<string, string | boolean>;
+
+			/**
+			 * Disable GPU acceleration for all CEF webviews.
+			 * Appends --disable-gpu and related switches before CEF initialization.
+			 * @default false
+			 */
+			disableGPU?: boolean;
 
 			/**
 			 * Path to application icon (PNG format recommended)

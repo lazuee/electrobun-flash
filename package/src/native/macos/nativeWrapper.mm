@@ -29,6 +29,12 @@ static bool wgpuDebugEnabled() {
 #include <netinet/in.h>
 #include <unistd.h>
 #include <signal.h>
+#include <execinfo.h>
+#include <sys/sysctl.h>
+#include <mach-o/dyld.h>
+#include <mach-o/nlist.h>
+#include <mach-o/loader.h>
+#include <mach/vm_map.h>
 #include <atomic>
 #include <mutex>
 #include "../shared/pending_resize_queue.h"
@@ -48,9 +54,9 @@ static bool wgpuDebugEnabled() {
 #include "include/cef_scheme.h"
 #include "include/cef_resource_handler.h"
 #include "include/cef_command_line.h"
-#include "include/cef_permission_handler.h"
 #include "include/cef_dialog_handler.h"
 #include "include/cef_download_handler.h"
+#include "include/cef_request_context_handler.h"
 #include <string>
 #include <vector>
 #include <list>
@@ -77,6 +83,7 @@ static bool wgpuDebugEnabled() {
 #include "../shared/app_paths.h"
 #include "../shared/accelerator_parser.h"
 #include "../shared/chromium_flags.h"
+#include "../shared/ppapi_flash.h"
 
 using namespace electrobun;
 
@@ -702,6 +709,7 @@ void releaseObjCObject(id objcObject) {
     @property (nonatomic, assign) BOOL isRemoved;
     @property (nonatomic, assign) BOOL isInFullscreen;
     @property (nonatomic, assign) BOOL isSandboxed;  // When true, only eventBridge is active (no RPC)
+    @property (nonatomic, assign) BOOL disableGPU;
     @property (nonatomic, assign) BOOL pendingStartTransparent;
     @property (nonatomic, assign) BOOL pendingStartPassthrough;
     @property (nonatomic, strong) CALayer *storedLayerMask;
@@ -835,7 +843,8 @@ static NSMutableDictionary<NSNumber *, AbstractView *> *globalAbstractViews = ni
                 electrobunPreloadScript:(const char *)electrobunPreloadScript
                 customPreloadScript:(const char *)customPreloadScript
                 transparent:(bool)transparent
-                sandbox:(bool)sandbox;
+                sandbox:(bool)sandbox
+                disableGPU:(bool)disableGPU;
 @end
 
 @interface WGPUViewImpl : AbstractView
@@ -2409,6 +2418,7 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
                 customPreloadScript:(const char *)customPreloadScript
                 transparent:(bool)transparent
                 sandbox:(bool)sandbox
+                disableGPU:(bool)disableGPU
     {
         self = [super init];
         if (self) {
@@ -4088,6 +4098,7 @@ private:
 ElectrobunHandler* ElectrobunHandler::g_instance = nullptr;
 
 electrobun::ChromiumFlagConfig g_userChromiumFlags;
+static bool g_disableGPU = false;
 
 class ElectrobunApp : public CefApp,
                      public CefBrowserProcessHandler,
@@ -4106,11 +4117,57 @@ public:
             {"enable-fullscreen", ""},
             {"remote-allow-origins", "*"},
             {"allow-insecure-localhost", ""},
+            {"allow-running-insecure-content", ""},
+            {"autoplay-policy", "no-user-gesture-required"},
+            {"process-per-tab", "1"},
+            // DevTools doesn't seem to be working when this is enabled
+            // http://magpcss.org/ceforum/viewtopic.php?f=6&t=14095
+            // {"enable-begin-frame-scheduling", "1"}
         };
         electrobun::applyDefaultFlags(defaults, g_userChromiumFlags.skip, command_line);
 
         // Apply user-defined chromium flags from build.json
         electrobun::applyChromiumFlags(g_userChromiumFlags, command_line);
+
+        // Apply GPU disable switches if configured in build.json
+        if (g_disableGPU) {
+            if (!command_line->HasSwitch("disable-gpu"))
+                command_line->AppendSwitch("disable-gpu");
+            if (!command_line->HasSwitch("disable-gpu-vsync"))
+                command_line->AppendSwitch("disable-gpu-vsync");
+            if (!command_line->HasSwitch("disable-gpu-sandbox"))
+                command_line->AppendSwitch("disable-gpu-sandbox");
+            if (!command_line->HasSwitch("disable-gpu-compositing"))
+                command_line->AppendSwitch("disable-gpu-compositing");
+            if (!command_line->HasSwitch("in-process-gpu"))
+                command_line->AppendSwitch("in-process-gpu");
+            NSLog(@"GPU acceleration disabled via configuration");
+        } else {
+            if (command_line->HasSwitch("disable-gpu")) {
+                if (!command_line->HasSwitch("disable-gpu-vsync"))
+                    command_line->AppendSwitch("disable-gpu-vsync");
+                if (!command_line->HasSwitch("disable-gpu-sandbox"))
+                    command_line->AppendSwitch("disable-gpu-sandbox");
+                if (!command_line->HasSwitch("disable-gpu-compositing"))
+                    command_line->AppendSwitch("disable-gpu-compositing");
+                if (!command_line->HasSwitch("in-process-gpu"))
+                    command_line->AppendSwitch("in-process-gpu");
+                NSLog(@"GPU acceleration disabled via command line switch");
+            }
+        }
+
+        // ppapi flash
+        std::string flashPath = electrobun::getPepperFlashPath();
+        if (!flashPath.empty()) {
+            NSLog(@"Enabling Pepper Flash plugin with path: %s", flashPath.c_str());
+            command_line->AppendSwitchWithValue("ppapi-flash-path", flashPath);
+            command_line->AppendSwitchWithValue("ppapi-flash-version", "32.0.0.465");
+            command_line->AppendSwitch("enable-system-flash");
+            command_line->AppendSwitch("allow-outdated-plugins");
+            command_line->AppendSwitchWithValue("plugin-policy", "allow");
+            command_line->AppendSwitch("run-all-flash-in-allow-mode");
+            command_line->AppendSwitch("disable-plugin-power-saver");
+        }
     }
     void OnRegisterCustomSchemes(CefRawPtr<CefSchemeRegistrar> registrar) override {        
         registrar->AddCustomScheme("views", 
@@ -4137,7 +4194,11 @@ public:
         
         // Prevent CEF helper processes from appearing in dock
         command_line->AppendSwitch("disable-background-mode");
-        command_line->AppendSwitch("disable-backgrounding-occluded-windows");            
+        command_line->AppendSwitch("disable-backgrounding-occluded-windows");
+        
+        // Prevent CEF helper processes from being suspended when in background
+        command_line->AppendSwitch("disable-renderer-backgrounding");
+        command_line->AppendSwitch("disable-background-timer-throttling");
     }
     void OnContextInitialized() override {
         // Register the scheme handler factory after context is initialized
@@ -4302,7 +4363,6 @@ class ElectrobunClient : public CefClient,
                         public CefContextMenuHandler,
                         public CefKeyboardHandler,
                         public CefResourceRequestHandler,
-                        public CefPermissionHandler,
                         public CefDisplayHandler,
                         public CefLifeSpanHandler,
                         public CefDownloadHandler  {
@@ -4378,17 +4438,14 @@ private:
 
         CefWindowInfo windowInfo;
         CefBrowserSettings settings;
-        windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
 
         CefWindowHandle parent = browser->GetHost()->GetWindowHandle();
         if (parent) {
             NSView* parentView = (__bridge NSView*)parent;
             NSRect bounds = [parentView bounds];
-            CefRect devtools_rect(0, 0, (int)bounds.size.width, (int)bounds.size.height);
-            windowInfo.SetAsChild(parent, devtools_rect);
+            windowInfo.SetAsChild(parent, 0, 0, (int)bounds.size.width, (int)bounds.size.height);
         } else {
-            CefRect devtools_rect(0, 0, 900, 700);
-            windowInfo.SetAsChild(nullptr, devtools_rect);
+            windowInfo.SetAsChild(nullptr, 0, 0, 900, 700);
         }
 
         browser->GetHost()->ShowDevTools(windowInfo, nullptr, settings, inspect_at);
@@ -4433,8 +4490,7 @@ private:
         CefRect devtools_rect(0, 0, (int)bounds.size.width, (int)bounds.size.height);
 
         CefWindowInfo windowInfo;
-        windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
-        windowInfo.SetAsChild((__bridge void*)contentView, devtools_rect);
+        windowInfo.SetAsChild((__bridge void*)contentView, (int)devtools_rect.x, (int)devtools_rect.y, (int)devtools_rect.width, (int)devtools_rect.height);
 
         CefBrowserSettings settings;
         host.browser = CefBrowserHost::CreateBrowserSync(
@@ -4623,10 +4679,6 @@ public:
         return this; 
     }
     
-    virtual CefRefPtr<CefPermissionHandler> GetPermissionHandler() override {
-        return this;
-    }
-    
     virtual CefRefPtr<CefDisplayHandler> GetDisplayHandler() override {
         return this;
     }
@@ -4666,7 +4718,7 @@ public:
     }
 
     // CefDownloadHandler methods
-    bool OnBeforeDownload(CefRefPtr<CefBrowser> browser,
+    void OnBeforeDownload(CefRefPtr<CefBrowser> browser,
                           CefRefPtr<CefDownloadItem> download_item,
                           const CefString& suggested_name,
                           CefRefPtr<CefBeforeDownloadCallback> callback) override {
@@ -4717,8 +4769,6 @@ public:
             NSLog(@"ERROR CEF Download: Could not find Downloads directory, using suggested name");
             callback->Continue("", false);  // Use default behavior
         }
-
-        return true;  // We handled it
     }
 
     void OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
@@ -5007,7 +5057,6 @@ public:
 
     bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
                       CefRefPtr<CefFrame> frame,
-                      int popup_id,
                       const CefString& target_url,
                       const CefString& target_frame_name,
                       CefLifeSpanHandler::WindowOpenDisposition target_disposition,
@@ -5019,11 +5068,11 @@ public:
                       CefRefPtr<CefDictionaryValue>& extra_info,
                       bool* no_javascript_access) override {
         CEF_REQUIRE_UI_THREAD();
-        
+
         // Check if this is a new window request (cmd+click, target="_blank", window.open, etc.)
-        bool isCmdClick = target_disposition == CEF_WOD_NEW_FOREGROUND_TAB || 
-                         target_disposition == CEF_WOD_NEW_BACKGROUND_TAB ||
-                         target_disposition == CEF_WOD_NEW_WINDOW;        
+        bool isCmdClick = target_disposition == WOD_NEW_FOREGROUND_TAB ||
+                         target_disposition == WOD_NEW_BACKGROUND_TAB ||
+                         target_disposition == WOD_NEW_WINDOW;        
         
         // Create event data with more context
         std::string eventData = "{\"url\":\"" + target_url.ToString() + 
@@ -5071,145 +5120,11 @@ public:
             
             // Handle ESC key to exit fullscreen (try both key codes)
             if (event.windows_key_code == 27 || event.native_key_code == 53) {
-                browser->GetHost()->ExitFullscreen(false);
+                browser->GetMainFrame()->ExecuteJavaScript("document.exitFullscreen()", "", 0);
                 return true;
             }                        
         }
         return false;
-    }
-    
-    // Permission Handler methods for CEF
-    virtual bool OnRequestMediaAccessPermission(
-        CefRefPtr<CefBrowser> browser,
-        CefRefPtr<CefFrame> frame,
-        const CefString& requesting_origin,
-        uint32_t requested_permissions,
-        CefRefPtr<CefMediaAccessCallback> callback) override {
-        
-        std::string origin = requesting_origin.ToString();
-        NSLog(@"CEF: Media access permission requested for %s (permissions: %u)", origin.c_str(), requested_permissions);
-        
-        // Check cache first
-        PermissionStatus cachedStatus = getPermissionFromCache(origin, PermissionType::USER_MEDIA);
-        
-        if (cachedStatus == PermissionStatus::ALLOWED) {
-            NSLog(@"CEF: Using cached permission: User previously allowed media access for %s", origin.c_str());
-            callback->Continue(requested_permissions); // Allow all requested permissions
-            return true;
-        } else if (cachedStatus == PermissionStatus::DENIED) {
-            NSLog(@"CEF: Using cached permission: User previously blocked media access for %s", origin.c_str());
-            callback->Cancel();
-            return true;
-        }
-        
-        // No cached permission, show dialog
-        NSLog(@"CEF: No cached permission found for %s, showing dialog", origin.c_str());
-        
-        // Show macOS native alert
-        NSString *message = @"This page wants to access your camera and/or microphone.\n\nDo you want to allow this?";
-        NSString *title = @"Camera & Microphone Access";
-        
-        NSAlert *alert = [[NSAlert alloc] init];
-        [alert setMessageText:title];
-        [alert setInformativeText:message];
-        [alert addButtonWithTitle:@"Allow"];
-        [alert addButtonWithTitle:@"Block"];
-        [alert setAlertStyle:NSAlertStyleInformational];
-        
-        NSModalResponse response = [alert runModal];
-        
-        // Handle response and cache the decision
-        if (response == NSAlertFirstButtonReturn) { // Allow
-            callback->Continue(requested_permissions); // Allow all requested permissions
-            cachePermission(origin, PermissionType::USER_MEDIA, PermissionStatus::ALLOWED);
-            NSLog(@"CEF: User allowed media access for %s (cached)", origin.c_str());
-        } else { // Block
-            callback->Cancel();
-            cachePermission(origin, PermissionType::USER_MEDIA, PermissionStatus::DENIED);
-            NSLog(@"CEF: User blocked media access for %s (cached)", origin.c_str());
-        }
-        
-        return true; // We handled the permission request
-    }
-    
-    virtual bool OnShowPermissionPrompt(
-        CefRefPtr<CefBrowser> browser,
-        uint64_t prompt_id,
-        const CefString& requesting_origin,
-        uint32_t requested_permissions,
-        CefRefPtr<CefPermissionPromptCallback> callback) override {
-        
-        std::string origin = requesting_origin.ToString();
-        NSLog(@"CEF: Permission prompt requested for %s (permissions: %u)", origin.c_str(), requested_permissions);
-        
-        // Handle different permission types
-        PermissionType permType = PermissionType::OTHER;
-        NSString *message = @"This page is requesting additional permissions.\n\nDo you want to allow this?";
-        NSString *title = @"Permission Request";
-        
-        // Check for specific permission types
-        if (requested_permissions & CEF_PERMISSION_TYPE_CAMERA_STREAM ||
-            requested_permissions & CEF_PERMISSION_TYPE_MIC_STREAM) {
-            permType = PermissionType::USER_MEDIA;
-            message = @"This page wants to access your camera and/or microphone.\n\nDo you want to allow this?";
-            title = @"Camera & Microphone Access";
-        } else if (requested_permissions & CEF_PERMISSION_TYPE_GEOLOCATION) {
-            permType = PermissionType::GEOLOCATION;
-            message = @"This page wants to access your location.\n\nDo you want to allow this?";
-            title = @"Location Access";
-        } else if (requested_permissions & CEF_PERMISSION_TYPE_NOTIFICATIONS) {
-            permType = PermissionType::NOTIFICATIONS;
-            message = @"This page wants to show notifications.\n\nDo you want to allow this?";
-            title = @"Notification Permission";
-        }
-        
-        // Check cache first
-        PermissionStatus cachedStatus = getPermissionFromCache(origin, permType);
-        
-        if (cachedStatus == PermissionStatus::ALLOWED) {
-            NSLog(@"CEF: Using cached permission: User previously allowed %@ for %s", title, origin.c_str());
-            callback->Continue(CEF_PERMISSION_RESULT_ACCEPT);
-            return true;
-        } else if (cachedStatus == PermissionStatus::DENIED) {
-            NSLog(@"CEF: Using cached permission: User previously blocked %@ for %s", title, origin.c_str());
-            callback->Continue(CEF_PERMISSION_RESULT_DENY);
-            return true;
-        }
-        
-        // No cached permission, show dialog
-        NSLog(@"CEF: No cached permission found for %s, showing dialog", origin.c_str());
-        
-        // Show macOS native alert
-        NSAlert *alert = [[NSAlert alloc] init];
-        [alert setMessageText:title];
-        [alert setInformativeText:message];
-        [alert addButtonWithTitle:@"Allow"];
-        [alert addButtonWithTitle:@"Block"];
-        [alert setAlertStyle:NSAlertStyleInformational];
-        
-        NSModalResponse response = [alert runModal];
-        
-        // Handle response and cache the decision
-        if (response == NSAlertFirstButtonReturn) { // Allow
-            callback->Continue(CEF_PERMISSION_RESULT_ACCEPT);
-            cachePermission(origin, permType, PermissionStatus::ALLOWED);
-            NSLog(@"CEF: User allowed %@ for %s (cached)", title, origin.c_str());
-        } else { // Block
-            callback->Continue(CEF_PERMISSION_RESULT_DENY);
-            cachePermission(origin, permType, PermissionStatus::DENIED);
-            NSLog(@"CEF: User blocked %@ for %s (cached)", title, origin.c_str());
-        }
-        
-        return true; // We handled the permission request
-    }
-    
-    virtual void OnDismissPermissionPrompt(
-        CefRefPtr<CefBrowser> browser,
-        uint64_t prompt_id,
-        cef_permission_request_result_t result) override {
-        
-        NSLog(@"CEF: Permission prompt %llu dismissed with result %d", prompt_id, result);
-        // Optional: Handle prompt dismissal if needed
     }
     
     // CefDialogHandler methods - commented out for now to prevent crashes
@@ -5299,7 +5214,7 @@ public:
                 if (event.keyCode == 53) { // ESC key code on macOS
                     NSLog(@"[CEF_FULLSCREEN] Local ESC key detected - exiting fullscreen for webview %u", webview_id_);
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        browser->GetHost()->ExitFullscreen(false);
+                        browser->GetMainFrame()->ExecuteJavaScript("document.exitFullscreen()", "", 0);
                     });
                     return nil; // Consume the event
                 }
@@ -5452,16 +5367,347 @@ void RemoteDevToolsClosed(void* ctx, int target_id) {
                 electrobunPreloadScript:(const char *)electrobunPreloadScript
                 customPreloadScript:(const char *)customPreloadScript
                 transparent:(bool)transparent
-                sandbox:(bool)sandbox;
+                sandbox:(bool)sandbox
+                disableGPU:(bool)disableGPU;
 
 @end
+
+// Swizzle NSProcessInfo.operatingSystemVersion to report macOS 10.15.7.
+// CEF/Chromium 87 has hardcoded checks that reject majorVersion > 11 (or 10.16).
+// On macOS 26+, the real version (major=26) causes "Unsupported majorVersion" → SIGTRAP.
+// Electron patches Chromium source directly; since CEF is precompiled, we use method swizzling
+// and symbol rebinding to intercept all OS version queries.
+static NSOperatingSystemVersion g_spoofedOSVersion = {10, 15, 7};
+static const char* g_spoofedVersionStr = "10.15.7";
+static bool g_osVersionSwizzled = false;
+
+static NSOperatingSystemVersion swizzled_operatingSystemVersion(id self, SEL _cmd) {
+    return g_spoofedOSVersion;
+}
+
+static NSString* swizzled_operatingSystemVersionString(id self, SEL _cmd) {
+    return [NSString stringWithFormat:@"Version %ld.%ld.%ld",
+            (long)g_spoofedOSVersion.majorVersion,
+            (long)g_spoofedOSVersion.minorVersion,
+            (long)g_spoofedOSVersion.patchVersion];
+}
+
+static BOOL swizzled_isOperatingSystemAtLeastVersion(id self, SEL _cmd, NSOperatingSystemVersion minVersion) {
+    if (g_spoofedOSVersion.majorVersion > minVersion.majorVersion) return YES;
+    if (g_spoofedOSVersion.majorVersion < minVersion.majorVersion) return NO;
+    if (g_spoofedOSVersion.minorVersion > minVersion.minorVersion) return YES;
+    if (g_spoofedOSVersion.minorVersion < minVersion.minorVersion) return NO;
+    return g_spoofedOSVersion.patchVersion >= minVersion.patchVersion;
+}
+
+// Intercept sysctlbyname to fake kern.osproductversion
+static int (*orig_sysctlbyname)(const char*, void*, size_t*, void*, size_t) = nullptr;
+
+static int hooked_sysctlbyname(const char* name, void* oldp, size_t* oldlenp, void* newp, size_t newlen) {
+    if (name && strcmp(name, "kern.osproductversion") == 0 && oldp && oldlenp) {
+        size_t len = strlen(g_spoofedVersionStr) + 1;
+        if (*oldlenp >= len) {
+            memcpy(oldp, g_spoofedVersionStr, len);
+            *oldlenp = len;
+            return 0;
+        } else if (*oldlenp == 0) {
+            *oldlenp = len;
+            return 0;
+        }
+    }
+    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+
+// Intercept _CFCopySystemVersionDictionary to return spoofed version
+typedef CFDictionaryRef (*CFCopySystemVersionDictionary_t)(void);
+static CFCopySystemVersionDictionary_t orig_CFCopySystemVersionDictionary = nullptr;
+
+static CFDictionaryRef hooked_CFCopySystemVersionDictionary(void) {
+    // Build a dictionary with the spoofed version
+    CFStringRef keys[] = {
+        CFSTR("ProductBuildVersion"),
+        CFSTR("ProductCopyright"),
+        CFSTR("ProductName"),
+        CFSTR("ProductUserVisibleVersion"),
+        CFSTR("ProductVersion"),
+        CFSTR("iOSSupportVersion")
+    };
+    CFStringRef values[] = {
+        CFSTR("19H2"),
+        CFSTR("1983-2020 Apple Inc."),
+        CFSTR("Mac OS X"),
+        CFSTR("10.15.7"),
+        CFSTR("10.15.7"),
+        CFSTR("13.7")
+    };
+    return CFDictionaryCreate(kCFAllocatorDefault,
+                              (const void**)keys, (const void**)values,
+                              6,
+                              &kCFTypeDictionaryKeyCallBacks,
+                              &kCFTypeDictionaryValueCallBacks);
+}
+
+// Minimal fishhook: rebind a single symbol in a specific Mach-O image
+// by patching the lazy/non-lazy symbol pointer tables
+static bool rebindSymbolInImage(const struct mach_header* header, intptr_t slide,
+                                 const char* symbolName, void* replacement, void** original) {
+    // Walk load commands to find __DATA,__la_symbol_ptr and __DATA,__nl_symbol_ptr
+    const struct mach_header_64* header64 = (const struct mach_header_64*)header;
+    const uint8_t* lc = (const uint8_t*)(header64 + 1);
+
+    // We need: LC_SYMTAB, LC_DYSYMTAB, and the __DATA segment
+    const struct symtab_command* symtab_cmd = nullptr;
+    const struct dysymtab_command* dysymtab_cmd = nullptr;
+    const struct segment_command_64* linkedit_seg = nullptr;
+    const struct segment_command_64* data_seg = nullptr;
+    const struct segment_command_64* data_const_seg = nullptr;
+
+    for (uint32_t i = 0; i < header64->ncmds; i++) {
+        const struct load_command* cmd = (const struct load_command*)lc;
+        if (cmd->cmd == LC_SYMTAB) {
+            symtab_cmd = (const struct symtab_command*)cmd;
+        } else if (cmd->cmd == LC_DYSYMTAB) {
+            dysymtab_cmd = (const struct dysymtab_command*)cmd;
+        } else if (cmd->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64* seg = (const struct segment_command_64*)cmd;
+            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit_seg = seg;
+            else if (strcmp(seg->segname, "__DATA") == 0) data_seg = seg;
+            else if (strcmp(seg->segname, "__DATA_CONST") == 0) data_const_seg = seg;
+        }
+        lc += cmd->cmdsize;
+    }
+
+    if (!symtab_cmd || !dysymtab_cmd || !linkedit_seg) return false;
+
+    // Calculate base addresses for symbol table, string table, and indirect symbols
+    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_seg->vmaddr - linkedit_seg->fileoff;
+    const struct nlist_64* symtab = (const struct nlist_64*)(linkedit_base + symtab_cmd->symoff);
+    const char* strtab = (const char*)(linkedit_base + symtab_cmd->stroff);
+    const uint32_t* indirect_symtab = (const uint32_t*)(linkedit_base + dysymtab_cmd->indirectsymoff);
+
+    // Helper lambda to patch a section's symbol pointers
+    auto patchSection = [&](const struct segment_command_64* seg) -> bool {
+        if (!seg) return false;
+        bool found = false;
+        const struct section_64* sections = (const struct section_64*)(seg + 1);
+        for (uint32_t j = 0; j < seg->nsects; j++) {
+            uint32_t type = sections[j].flags & SECTION_TYPE;
+            if (type != S_LAZY_SYMBOL_POINTERS &&
+                type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+
+            uint32_t nptrs = (uint32_t)(sections[j].size / sizeof(void*));
+            void** ptrs = (void**)(slide + sections[j].addr);
+            uint32_t indirect_index = sections[j].reserved1;
+
+            for (uint32_t k = 0; k < nptrs; k++) {
+                uint32_t symidx = indirect_symtab[indirect_index + k];
+                if (symidx == INDIRECT_SYMBOL_ABS || symidx == INDIRECT_SYMBOL_LOCAL) continue;
+                if (symidx >= symtab_cmd->nsyms) continue;
+                const char* name = strtab + symtab[symidx].n_un.n_strx;
+                if (strcmp(name, symbolName) != 0) continue;
+                if (original) *original = ptrs[k];
+                // Make the page writable, patch, restore
+                vm_address_t page = (vm_address_t)&ptrs[k] & ~(vm_page_size - 1);
+                kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size,
+                                              false, VM_PROT_READ | VM_PROT_WRITE);
+                if (kr == KERN_SUCCESS) {
+                    ptrs[k] = replacement;
+                    vm_protect(mach_task_self(), page, vm_page_size,
+                               false, VM_PROT_READ | VM_PROT_EXECUTE);
+                    found = true;
+                    NSLog(@"[CEF] Rebound symbol %s in section %s", symbolName, sections[j].sectname);
+                }
+            }
+        }
+        return found;
+    };
+
+    bool result = false;
+    if (data_seg) result |= patchSection(data_seg);
+    if (data_const_seg) result |= patchSection(data_const_seg);
+    return result;
+}
+
+// Find the CEF framework image and rebind version-related symbols
+static void rebindCEFVersionSymbols() {
+    const struct mach_header* cefHeader = nullptr;
+    intptr_t cefSlide = 0;
+
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char* name = _dyld_get_image_name(i);
+        if (name && strstr(name, "Chromium Embedded Framework")) {
+            cefHeader = _dyld_get_image_header(i);
+            cefSlide = _dyld_get_image_vmaddr_slide(i);
+            NSLog(@"[CEF] Found CEF framework at image %d, slide %ld", i, (long)cefSlide);
+            break;
+        }
+    }
+
+    if (!cefHeader) {
+        NSLog(@"[CEF] WARNING: Could not find CEF framework image for symbol rebinding");
+        return;
+    }
+
+    // Rebind sysctlbyname in CEF
+    orig_sysctlbyname = &sysctlbyname;
+    if (rebindSymbolInImage(cefHeader, cefSlide, "_sysctlbyname",
+                            (void*)hooked_sysctlbyname, (void**)&orig_sysctlbyname)) {
+        NSLog(@"[CEF] Rebound sysctlbyname in CEF framework");
+    }
+
+    // Rebind _CFCopySystemVersionDictionary in CEF
+    void* cfFunc = dlsym(RTLD_DEFAULT, "_CFCopySystemVersionDictionary");
+    if (cfFunc) {
+        orig_CFCopySystemVersionDictionary = (CFCopySystemVersionDictionary_t)cfFunc;
+        if (rebindSymbolInImage(cefHeader, cefSlide, "__CFCopySystemVersionDictionary",
+                                (void*)hooked_CFCopySystemVersionDictionary,
+                                (void**)&orig_CFCopySystemVersionDictionary)) {
+            NSLog(@"[CEF] Rebound _CFCopySystemVersionDictionary in CEF framework");
+        }
+    }
+
+    // Also rebind in ALL loaded images (the main binary and other dylibs may call these)
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header* hdr = _dyld_get_image_header(i);
+        intptr_t sl = _dyld_get_image_vmaddr_slide(i);
+        if (hdr == cefHeader) continue; // already done
+        rebindSymbolInImage(hdr, sl, "_sysctlbyname",
+                            (void*)hooked_sysctlbyname, nullptr);
+        if (cfFunc) {
+            rebindSymbolInImage(hdr, sl, "__CFCopySystemVersionDictionary",
+                                (void*)hooked_CFCopySystemVersionDictionary, nullptr);
+        }
+    }
+}
+
+static void swizzleOSVersion() {
+    if (g_osVersionSwizzled) return;
+
+    NSOperatingSystemVersion realVersion = [[NSProcessInfo processInfo] operatingSystemVersion];
+    NSLog(@"[CEF] Real macOS version: %ld.%ld.%ld",
+          (long)realVersion.majorVersion, (long)realVersion.minorVersion, (long)realVersion.patchVersion);
+
+    // Only swizzle if macOS version is too new for Chromium 87 (> 11.x / 10.16)
+    if (realVersion.majorVersion >= 12 ||
+        (realVersion.majorVersion == 10 && realVersion.minorVersion > 16)) {
+
+        Method origMethod = class_getInstanceMethod([NSProcessInfo class], @selector(operatingSystemVersion));
+        if (origMethod) {
+            method_setImplementation(origMethod, (IMP)swizzled_operatingSystemVersion);
+            NSLog(@"[CEF] Swizzled operatingSystemVersion to report %ld.%ld.%ld for CEF compatibility",
+                  (long)g_spoofedOSVersion.majorVersion, (long)g_spoofedOSVersion.minorVersion,
+                  (long)g_spoofedOSVersion.patchVersion);
+            g_osVersionSwizzled = true;
+        }
+
+        // Also swizzle operatingSystemVersionString and isOperatingSystemAtLeastVersion:
+        Method strMethod = class_getInstanceMethod([NSProcessInfo class], @selector(operatingSystemVersionString));
+        if (strMethod) {
+            method_setImplementation(strMethod, (IMP)swizzled_operatingSystemVersionString);
+        }
+        Method atLeastMethod = class_getInstanceMethod([NSProcessInfo class], @selector(isOperatingSystemAtLeastVersion:));
+        if (atLeastMethod) {
+            method_setImplementation(atLeastMethod, (IMP)swizzled_isOperatingSystemAtLeastVersion);
+        }
+    }
+
+    // Also set SYSTEM_VERSION_COMPAT_DIRS for any plist-based version lookups
+    NSString* tmpDir = NSTemporaryDirectory();
+    NSString* compatDir = [tmpDir stringByAppendingPathComponent:@"electrobun-cef-compat"];
+    NSString* coreServicesDir = [compatDir stringByAppendingPathComponent:@"System/Library/CoreServices"];
+
+    [[NSFileManager defaultManager] createDirectoryAtPath:coreServicesDir
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+
+    NSString* plistPath = [coreServicesDir stringByAppendingPathComponent:@"SystemVersion.plist"];
+    NSDictionary* versionDict = @{
+        @"ProductBuildVersion": @"19H2",
+        @"ProductCopyright": @"1983-2020 Apple Inc.",
+        @"ProductName": @"Mac OS X",
+        @"ProductUserVisibleVersion": @"10.15.7",
+        @"ProductVersion": @"10.15.7",
+        @"iOSSupportVersion": @"13.7"
+    };
+    [versionDict writeToFile:plistPath atomically:YES];
+    setenv("SYSTEM_VERSION_COMPAT_DIRS", [compatDir UTF8String], 1);
+    NSLog(@"[CEF] Set SYSTEM_VERSION_COMPAT_DIRS=%@", compatDir);
+
+    // Rebind C-level version functions in the CEF framework binary
+    // This catches _CFCopySystemVersionDictionary and sysctlbyname("kern.osproductversion")
+    rebindCEFVersionSymbols();
+}
+
+// Patch Chromium's allocator interception that crashes on macOS 26.
+// On newer macOS, malloc zone internals changed, causing CHECK failures in
+// base/allocator/allocator_interception_mac.mm. There are 11 IMMEDIATE_CRASH()
+// sites in this region. Rather than patching each individually, we patch the
+// entry points of the problematic functions to return immediately (RET),
+// skipping all malloc zone shimming entirely. This is safe because the shim
+// is not required for correct operation — it's an optimization for Chromium's
+// partition allocator that we don't rely on.
+//
+// CEF 87.1.14 allocator function layout (file offsets):
+//   0x03103150: Function with CHECKs at 0x0310312A-0x03103130 (3 crash sites)
+//   0x031039F0: ShimNewMallocZonesAndReschedule - CHECK at 0x03103CB9
+//   Other functions in region have their own CHECK clusters
+static void patchCEFAllocatorCrash() {
+    const struct mach_header* cefHeader = nullptr;
+
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char* name = _dyld_get_image_name(i);
+        if (name && strstr(name, "Chromium Embedded Framework")) {
+            cefHeader = _dyld_get_image_header(i);
+            break;
+        }
+    }
+    if (!cefHeader) return;
+
+    // Patch function entry points to RET (0xC3), making them no-ops.
+    // Each function starts with 55 48 89 E5 (PUSH RBP; MOV RBP, RSP).
+    // We replace the first byte with C3 (RET) so the function returns immediately.
+    static const uint32_t func_entries[] = {
+        0x031039F0,  // ShimNewMallocZonesAndReschedule
+    };
+
+    for (uint32_t offset : func_entries) {
+        uint8_t* addr = (uint8_t*)cefHeader + offset;
+
+        // Verify function prologue: PUSH RBP (0x55)
+        if (addr[0] == 0x55 && addr[1] == 0x48 && addr[2] == 0x89 && addr[3] == 0xE5) {
+            vm_address_t page = (vm_address_t)addr & ~(vm_page_size - 1);
+            kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size,
+                                          false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+            if (kr == KERN_SUCCESS) {
+                addr[0] = 0xC3;  // RET — immediately return from function
+                vm_protect(mach_task_self(), page, vm_page_size,
+                           false, VM_PROT_READ | VM_PROT_EXECUTE);
+                NSLog(@"[CEF] Patched allocator function at 0x%x to RET (skip malloc zone shimming)", offset);
+            } else {
+                NSLog(@"[CEF] WARNING: Failed to patch function at 0x%x (vm_protect error %d)", offset, kr);
+            }
+        } else {
+            NSLog(@"[CEF] Function prologue not found at 0x%x (got %02x %02x %02x %02x)",
+                  offset, addr[0], addr[1], addr[2], addr[3]);
+        }
+    }
+}
 
 bool initializeCEF() {
     static bool initialized = false;
     if (initialized) return true;
-    
+
+    // Swizzle OS version BEFORE any CEF/Chromium code runs
+    swizzleOSVersion();
+
+    // Patch known crash sites in CEF binary (allocator CHECK on macOS 26+)
+    patchCEFAllocatorCrash();
+
     [ElectrobunNSApplication sharedApplication];
-    if (![NSApp isKindOfClass:[ElectrobunNSApplication class]]) {        
+    if (![NSApp isKindOfClass:[ElectrobunNSApplication class]]) {
         return false;
     }
 
@@ -5481,6 +5727,7 @@ bool initializeCEF() {
     if (buildJsonPath) {
         std::string buildJsonContent = electrobun::readFileToString([buildJsonPath UTF8String]);
         g_userChromiumFlags = electrobun::parseChromiumFlags(buildJsonContent);
+        g_disableGPU = electrobun::parseDisableGPU(buildJsonContent);
     }
 
     CefSettings settings;
@@ -5503,18 +5750,19 @@ bool initializeCEF() {
         CefString(&settings.main_bundle_path) = [bundlePath UTF8String];
     }
 
-    NSString* frameworkPath = [[NSBundle mainBundle]
-        pathForResource:@"Chromium Embedded Framework"
-                 ofType:@"framework"
-            inDirectory:@"Contents/Frameworks"];
-    if (frameworkPath) {
+    // Use privateFrameworksPath (Contents/Frameworks/) to locate CEF and helpers.
+    // pathForResource:ofType:inDirectory: searches under Contents/Resources/ which is wrong,
+    // and pathForAuxiliaryExecutable: searches under Contents/MacOS/ which is also wrong.
+    NSString* frameworksPath = [[NSBundle mainBundle] privateFrameworksPath];
+    NSString* frameworkPath = [frameworksPath stringByAppendingPathComponent:@"Chromium Embedded Framework.framework"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:frameworkPath]) {
         CefString(&settings.framework_dir_path) = [frameworkPath UTF8String];
+        NSLog(@"[CEF] Using framework at: %@", frameworkPath);
     }
 
     // This prevents multiple apps from sharing the same helper.
-    NSString* helperPath =
-        [[NSBundle mainBundle] pathForAuxiliaryExecutable:@"bun Helper.app/Contents/MacOS/bun Helper"];
-    if (helperPath) {
+    NSString* helperPath = [frameworksPath stringByAppendingPathComponent:@"bun Helper.app/Contents/MacOS/bun Helper"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:helperPath]) {
         CefString(&settings.browser_subprocess_path) = [helperPath UTF8String];
         NSLog(@"[CEF] Using helper at: %@", helperPath);
     }
@@ -5532,7 +5780,15 @@ bool initializeCEF() {
     );
     NSString* cachePath = [NSString stringWithUTF8String:cachePathStr.c_str()];
     NSLog(@"[CEF] Using path: %s", cachePathStr.c_str());
+
+    // Ensure cache directory exists before CefInitialize
+    [[NSFileManager defaultManager] createDirectoryAtPath:cachePath
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+
     CefString(&settings.root_cache_path) = [cachePath UTF8String];
+    CefString(&settings.cache_path) = [cachePath UTF8String];
 
     // Set log file path for debugging
     NSString* logPath = [cachePath stringByAppendingPathComponent:@"debug.log"];
@@ -5557,18 +5813,64 @@ bool initializeCEF() {
     // commandLine->AppendSwitch("allow-file-access-from-files");
     // commandLine->AppendSwitch("allow-universal-access-from-files");
     // commandLine->AppendSwitch("disable-web-security");
-    
+
     // Enable required packaged services
-    // settings.packaged_services = cef_services_t::CEF_SERVICE_ALL;    
+    // settings.packaged_services = cef_services_t::CEF_SERVICE_ALL;
+    
+#if 1
+    // Install SIGTRAP/SIGABRT handler to capture backtrace if CEF crashes during init
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = [](int sig, siginfo_t* info, void* ucontext) {
+        const char* signame = (sig == SIGTRAP) ? "SIGTRAP" : (sig == SIGABRT) ? "SIGABRT" : "SIGNAL";
+        char buf[256];
+        int len = snprintf(buf, sizeof(buf),
+            "\n[CEF] *** Caught %s (signal %d) during CefInitialize ***\n"
+            "[CEF] Backtrace:\n", signame, sig);
+        write(STDERR_FILENO, buf, len);
+
+        // Capture backtrace
+        void* frames[64];
+        int count = backtrace(frames, 64);
+        backtrace_symbols_fd(frames, count, STDERR_FILENO);
+
+        // Also try to get symbolicated info via dladdr
+        write(STDERR_FILENO, "\n[CEF] Symbolicated backtrace:\n", 31);
+        for (int i = 0; i < count; i++) {
+            Dl_info dl_info;
+            if (dladdr(frames[i], &dl_info)) {
+                int slen = snprintf(buf, sizeof(buf), "  [%d] %s (%s + %ld)\n",
+                    i,
+                    dl_info.dli_sname ? dl_info.dli_sname : "???",
+                    dl_info.dli_fname ? dl_info.dli_fname : "???",
+                    (long)((char*)frames[i] - (char*)dl_info.dli_saddr));
+                write(STDERR_FILENO, buf, slen);
+            }
+        }
+
+        write(STDERR_FILENO, "\n", 1);
+        _exit(128 + sig);
+    };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGTRAP, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGILL, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+    sigaction(SIGSEGV, &sa, nullptr);
+#endif
+
+    NSLog(@"[CEF] Calling CefInitialize...");
     bool result = CefInitialize(main_args, settings, g_app.get(), nullptr);
+    NSLog(@"[CEF] CefInitialize returned: %s", result ? "true" : "false");
 
     for (int i = 0; i < argc; i++) free(argv[i]);
     free(argv);
     
-    if (!result) {        
+    if (!result) {
         return false;
     }
-    
+
     initialized = true;
     return true;
 }
@@ -5805,6 +6107,14 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
   NSLog(@"DEBUG CEF: Registered scheme handler factory for partition '%s' - success: %s",
         partitionIdentifier ? partitionIdentifier : "(default)", registered ? "yes" : "no");
 
+  // Allow plugins (PPAPI Flash) by default — value 1 = CONTENT_SETTING_ALLOW
+  CefString error;
+  CefRefPtr<CefValue> pluginVal = CefValue::Create();
+  pluginVal->SetInt(1);
+  if (!context->SetPreference("profile.default_content_setting_values.plugins", pluginVal, error)) {
+      NSLog(@"DEBUG CEF: Failed to set plugins preference: %s", error.ToString().c_str());
+  }
+
   return context;
 }
 
@@ -5828,6 +6138,7 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
             customPreloadScript:(const char *)customPreloadScript
             transparent:(bool)transparent
             sandbox:(bool)sandbox
+            disableGPU:(bool)disableGPU
     {
         self = [super init];
         if (self) {
@@ -5851,7 +6162,6 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
                 }
 
                 CefWindowInfo window_info;
-                window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
 
                 NSView *contentView = window.contentView;
 
@@ -5875,7 +6185,7 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
                     window_info.SetAsWindowless((__bridge void*)window);
                 } else {
                     self.isOSRMode = NO;
-                    window_info.SetAsChild((__bridge void*)contentView, cefBounds);
+                    window_info.SetAsChild((__bridge void*)contentView, cefBounds.x, cefBounds.y, cefBounds.width, cefBounds.height);
                 }
 
                 CefRefPtr<CefRequestContext> requestContext = CreateRequestContextForPartition(
@@ -6199,7 +6509,8 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
         bool caseSensitive = matchCase ? true : false;
 
         // Use CEF's native find functionality
-        host->Find(CefString(searchText), forwardDirection, caseSensitive, findNext);
+        // CEF 87 requires an identifier (use 1 as a simple find request ID)
+        host->Find(1, CefString(searchText), forwardDirection, caseSensitive, findNext);
     }
 
     - (void)stopFindInPage {
@@ -6542,7 +6853,8 @@ extern "C" AbstractView* initWebview(uint32_t webviewId,
                         const char *electrobunPreloadScript,
                         const char *customPreloadScript,
                         bool transparent,
-                        bool sandbox ) {
+                        bool sandbox,
+                        bool disableGPU) {
 
     // Read and clear pre-set flags
     bool startTransparent = g_nextWebviewFlags.startTransparent;
@@ -6588,7 +6900,8 @@ extern "C" AbstractView* initWebview(uint32_t webviewId,
                                         electrobunPreloadScript:strdup(electrobunPreloadScript)
                                         customPreloadScript:strdup(customPreloadScript)
                                         transparent:transparent
-                                        sandbox:sandbox];
+                                        sandbox:sandbox
+                                        disableGPU:disableGPU];
 
         // Store initial state flags — applied later in each impl's deferred creation block
         // (nsView is nil at this point because view creation is async)

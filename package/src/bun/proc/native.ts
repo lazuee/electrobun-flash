@@ -211,6 +211,7 @@ export const native = (() => {
 					FFIType.cstring, // customPreloadScript
 					FFIType.bool, // transparent
 					FFIType.bool, // sandbox - when true, bunBridge and internalBridge are not set up
+					FFIType.bool, // disableGPU
 				],
 				returns: FFIType.ptr,
 			},
@@ -1095,6 +1096,7 @@ export const ffi = {
 			autoResize: boolean;
 			navigationRules: string | null;
 			sandbox: boolean;
+			disableGPU: boolean;
 			startTransparent: boolean;
 			startPassthrough: boolean;
 		}): FFIType.ptr => {
@@ -1113,6 +1115,7 @@ export const ffi = {
 				frame: { x, y, width, height },
 				autoResize,
 				sandbox,
+				disableGPU,
 				startTransparent,
 				startPassthrough,
 			} = params;
@@ -1144,8 +1147,15 @@ export const ffi = {
 				dynamicPreload = `
 window.__electrobunWebviewId = ${id};
 window.__electrobunWindowId = ${windowId};
-window.__electrobunEventBridge = window.__electrobunEventBridge || window.webkit?.messageHandlers?.eventBridge || window.eventBridge || window.chrome?.webview?.hostObjects?.eventBridge;
-window.__electrobunInternalBridge = window.__electrobunInternalBridge || window.webkit?.messageHandlers?.internalBridge || window.internalBridge || window.chrome?.webview?.hostObjects?.internalBridge;
+Gemini said
+window.__electrobunEventBridge = window.__electrobunEventBridge ||
+(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.eventBridge) ||
+window.eventBridge ||
+(window.chrome && window.chrome.webview && window.chrome.webview.hostObjects && window.chrome.webview.hostObjects.eventBridge);
+window.__electrobunInternalBridge = window.__electrobunInternalBridge ||
+(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.internalBridge) ||
+window.internalBridge ||
+(window.chrome && window.chrome.webview && window.chrome.webview.hostObjects && window.chrome.webview.hostObjects.internalBridge);
 `;
 				selectedPreloadScript = preloadScriptSandboxed;
 			} else {
@@ -1156,9 +1166,18 @@ window.__electrobunWebviewId = ${id};
 window.__electrobunWindowId = ${windowId};
 window.__electrobunRpcSocketPort = ${rpcPort};
 window.__electrobunSecretKeyBytes = [${secretKey}];
-window.__electrobunEventBridge = window.__electrobunEventBridge || window.webkit?.messageHandlers?.eventBridge || window.eventBridge || window.chrome?.webview?.hostObjects?.eventBridge;
-window.__electrobunInternalBridge = window.__electrobunInternalBridge || window.webkit?.messageHandlers?.internalBridge || window.internalBridge || window.chrome?.webview?.hostObjects?.internalBridge;
-window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.messageHandlers?.bunBridge || window.bunBridge || window.chrome?.webview?.hostObjects?.bunBridge;
+window.__electrobunEventBridge = window.__electrobunEventBridge ||
+(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.eventBridge) ||
+window.eventBridge ||
+(window.chrome && window.chrome.webview && window.chrome.webview.hostObjects && window.chrome.webview.hostObjects.eventBridge);
+window.__electrobunInternalBridge = window.__electrobunInternalBridge ||
+(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.internalBridge) ||
+window.internalBridge ||
+(window.chrome && window.chrome.webview && window.chrome.webview.hostObjects && window.chrome.webview.hostObjects.internalBridge);
+window.__electrobunBunBridge = window.__electrobunBunBridge ||
+(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bunBridge) ||
+window.bunBridge ||
+(window.chrome && window.chrome.webview && window.chrome.webview.hostObjects && window.chrome.webview.hostObjects.bunBridge);
 `;
 				selectedPreloadScript = preloadScript;
 			}
@@ -1189,6 +1208,7 @@ window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.me
 				toCString(customPreload || ""),
 				transparent,
 				sandbox, // When true, bunBridge and internalBridge are not set up in native code
+				disableGPU,
 			);
 
 			if (!webviewPtr) {

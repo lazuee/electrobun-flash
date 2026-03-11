@@ -40,6 +40,8 @@ export type BrowserViewOptions<T = undefined> = {
 	// Use for untrusted content (remote URLs) to prevent malicious sites from
 	// accessing internal APIs, creating OOPIFs, or communicating with Bun
 	sandbox: boolean;
+	// Disable GPU acceleration for this webview
+	disableGPU: boolean;
 	// Set transparent on the AbstractView at creation (before first paint)
 	startTransparent: boolean;
 	// Set passthrough on the AbstractView at creation (before first paint)
@@ -97,6 +99,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 	navigationRules: string | null = null;
 	// Sandbox mode disables RPC and only allows event emission (for untrusted content)
 	sandbox: boolean = false;
+	disableGPU: boolean = false;
 	startTransparent: boolean = false;
 	startPassthrough: boolean = false;
 
@@ -124,6 +127,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		this.navigationRules = options.navigationRules || null;
 		this.renderer = options.renderer ?? defaultOptions.renderer ?? "native";
 		this.sandbox = options.sandbox ?? false;
+		this.disableGPU = options.disableGPU ?? false;
 		this.startTransparent = options.startTransparent ?? false;
 		this.startPassthrough = options.startPassthrough ?? false;
 
@@ -175,6 +179,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			autoResize: this.autoResize,
 			navigationRules: this.navigationRules,
 			sandbox: this.sandbox,
+			disableGPU: this.disableGPU,
 			startTransparent: this.startTransparent,
 			startPassthrough: this.startPassthrough,
 			// transparent is looked up from parent window in native.ts
@@ -198,7 +203,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 				? jsonMessage
 				: JSON.stringify(jsonMessage);
 		// todo (yoav): make this a shared const with the browser api
-		const wrappedMessage = `window.__electrobun.receiveMessageFromBun(${stringifiedMessage})`;
+		const wrappedMessage = `window.__electrobun && window.__electrobun.receiveMessageFromBun && window.__electrobun.receiveMessageFromBun(${stringifiedMessage})`;
 		this.executeJavascript(wrappedMessage);
 	}
 
@@ -208,7 +213,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 				? jsonMessage
 				: JSON.stringify(jsonMessage);
 		// todo (yoav): make this a shared const with the browser api
-		const wrappedMessage = `window.__electrobun.receiveInternalMessageFromBun(${stringifiedMessage})`;
+		const wrappedMessage = `window.__electrobun && window.__electrobun.receiveInternalMessageFromBun && window.__electrobun.receiveInternalMessageFromBun(${stringifiedMessage})`;
 		this.executeJavascript(wrappedMessage);
 	}
 

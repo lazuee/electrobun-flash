@@ -10,7 +10,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const platform = process.platform;
-const arch = process.arch;
 
 // Map Node.js platform/arch to our naming
 const platformMap = {
@@ -19,14 +18,10 @@ const platformMap = {
 	win32: "win",
 };
 
-const archMap = {
-	x64: "x64",
-	arm64: "arm64",
-};
 
 const platformName = platformMap[platform] || platform;
-// Always use x64 for Windows since we only build x64 Windows binaries
-const archName = platform === "win32" ? "x64" : archMap[arch] || arch;
+// Always use x64 since we only build x64 binaries
+const archName = "x64";
 
 console.log(`Packaging Electrobun for ${platformName}-${archName}...`);
 
@@ -86,9 +81,8 @@ if (!fs.existsSync("bin")) {
 	fs.mkdirSync("bin", { recursive: true });
 }
 
-// Use baseline target for Windows to ensure compatibility with ARM64 emulation
-const compileTarget =
-	platform === "win32" ? "--target=bun-windows-x64-baseline" : "";
+// Use baseline target to ensure compatibility with ARM64 emulation
+const compileTarget = `--target=bun-${platform === "win32" ? "windows" : platform === "darwin" ? "darwin" : "linux"}-${archName}-baseline`;
 const vendoredBun = path.join(
 	"vendors",
 	"bun",

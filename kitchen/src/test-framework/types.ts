@@ -60,6 +60,7 @@ export interface WindowOptions {
   renderer?: 'cef' | 'native';
   hidden?: boolean;
   sandbox?: boolean; // When true, disables RPC and only allows event emission
+  disableGPU?: boolean; // When true, disables GPU and forces software rendering
 }
 
 export interface TestWindow {

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    h2 { margin-bottom: 10px; color: #fff; }
+    p.desc { color: #999; margin-bottom: 20px; font-size: 14px; }
+    .status-box {
+      background: #16213e;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .status-box h3 {
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #888;
+      margin-bottom: 10px;
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 0;
+      border-bottom: 1px solid #2a2a4a;
+    }
+    .status-row:last-child { border-bottom: none; }
+    .indicator {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .indicator.disabled { background: #4caf50; }
+    .indicator.enabled { background: #f44336; }
+    .indicator.unknown { background: #ff9800; }
+    .label { font-size: 14px; }
+    .value { font-size: 14px; color: #aaa; margin-left: auto; font-family: monospace; }
+    .btn {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      cursor: pointer;
+      font-weight: 600;
+      margin-top: auto;
+    }
+    .btn-check {
+      background: #0f3460;
+      color: #e94560;
+    }
+    .btn-check:hover { background: #1a4a7a; }
+    #result {
+      margin-top: 15px;
+      padding: 15px;
+      border-radius: 8px;
+      display: none;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    #result.pass { display: block; background: #1b3a1b; color: #4caf50; }
+    #result.fail { display: block; background: #3a1b1b; color: #f44336; }
+    #result.checking { display: block; background: #2a2a1b; color: #ff9800; }
+    .canvas-test { margin-top: 15px; }
+    canvas { border: 1px solid #333; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h2>GPU Disabled Test</h2>
+  <p class="desc">This window was created with <code>disableGPU: true</code>. Click the button to verify GPU is disabled.</p>
+
+  <div class="status-box">
+    <h3>GPU Status</h3>
+    <div class="status-row">
+      <div class="indicator unknown" id="gpuIndicator"></div>
+      <span class="label">GPU Acceleration</span>
+      <span class="value" id="gpuStatus">Checking...</span>
+    </div>
+    <div class="status-row">
+      <div class="indicator unknown" id="rendererIndicator"></div>
+      <span class="label">Renderer</span>
+      <span class="value" id="rendererStatus">—</span>
+    </div>
+    <div class="status-row">
+      <div class="indicator unknown" id="canvasIndicator"></div>
+      <span class="label">WebGL</span>
+      <span class="value" id="canvasStatus">—</span>
+    </div>
+  </div>
+
+  <div class="canvas-test">
+    <canvas id="testCanvas" width="200" height="40"></canvas>
+  </div>
+
+  <button class="btn btn-check" id="checkBtn" onclick="checkGPU()">Check GPU Status</button>
+  <div id="result"></div>
+
+  <script>
+    function checkGPU() {
+      const result = document.getElementById('result');
+      const gpuIndicator = document.getElementById('gpuIndicator');
+      const gpuStatus = document.getElementById('gpuStatus');
+      const rendererIndicator = document.getElementById('rendererIndicator');
+      const rendererStatus = document.getElementById('rendererStatus');
+      const canvasIndicator = document.getElementById('canvasIndicator');
+      const canvasStatus = document.getElementById('canvasStatus');
+
+      result.className = 'checking';
+      result.textContent = 'Checking GPU status...';
+
+      // Check WebGL availability
+      const canvas = document.getElementById('testCanvas');
+      let webglAvailable = false;
+      let rendererInfo = 'N/A';
+
+      try {
+        const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+        if (gl) {
+          webglAvailable = true;
+          const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+          if (debugInfo) {
+            rendererInfo = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL);
+          } else {
+            rendererInfo = 'WebGL (no debug info)';
+          }
+
+          // Draw a test pattern
+          gl.clearColor(0.2, 0.4, 0.6, 1.0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+        }
+      } catch (e) {
+        rendererInfo = 'WebGL unavailable';
+      }
+
+      // Determine if GPU is truly disabled
+      // When GPU is disabled, WebGL typically falls back to SwiftShader/software
+      // or is completely unavailable
+      const isSoftware = rendererInfo.toLowerCase().includes('swiftshader') ||
+                         rendererInfo.toLowerCase().includes('software') ||
+                         rendererInfo.toLowerCase().includes('llvmpipe');
+      const gpuDisabled = !webglAvailable || isSoftware;
+
+      // Update WebGL status
+      if (!webglAvailable) {
+        canvasIndicator.className = 'indicator disabled';
+        canvasStatus.textContent = 'Unavailable (GPU disabled)';
+      } else if (isSoftware) {
+        canvasIndicator.className = 'indicator disabled';
+        canvasStatus.textContent = 'Software fallback';
+      } else {
+        canvasIndicator.className = 'indicator enabled';
+        canvasStatus.textContent = 'Hardware accelerated';
+      }
+
+      // Update renderer info
+      rendererIndicator.className = isSoftware || !webglAvailable ? 'indicator disabled' : 'indicator enabled';
+      rendererStatus.textContent = rendererInfo.length > 30 ? rendererInfo.substring(0, 30) + '...' : rendererInfo;
+
+      // Update GPU status
+      if (gpuDisabled) {
+        gpuIndicator.className = 'indicator disabled';
+        gpuStatus.textContent = 'Disabled';
+        result.className = 'pass';
+        result.innerHTML = '<strong>✓ GPU is disabled.</strong><br>' +
+          (webglAvailable ? 'WebGL is using software rendering (' + rendererInfo + ')' : 'WebGL is completely unavailable') +
+          '<br>The --disable-gpu flag is working correctly.';
+      } else {
+        gpuIndicator.className = 'indicator enabled';
+        gpuStatus.textContent = 'Enabled';
+        result.className = 'fail';
+        result.innerHTML = '<strong>✗ GPU appears to be enabled.</strong><br>' +
+          'Renderer: ' + rendererInfo +
+          '<br>The --disable-gpu flag may not be applied.';
+      }
+    }
+
+    // Auto-check on load after a short delay
+    setTimeout(checkGPU, 500);
+  </script>
+</body>
+</html>

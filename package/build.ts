@@ -22,8 +22,6 @@ import {
 } from "./src/shared/cef-version";
 import { BUN_VERSION } from "./src/shared/bun-version";
 
-console.log("building...", platform(), arch());
-
 const { values: args } = parseArgs({
 	args: Bun.argv,
 	options: {
@@ -41,15 +39,17 @@ const { values: args } = parseArgs({
 });
 
 // TODO: set via cl arg
-const CHANNEL: "debug" | "release" = args.release ? "release" : "debug";
+const CHANNEL = args.release ? "release" : "debug";
 const IS_NPM_BUILD = args.npm || false;
-const OS: "win" | "linux" | "macos" = getPlatform();
-const ARCH: "arm64" | "x64" = getArch();
+const OS = getPlatform();
+const ARCH = getArch();
 
 const isWindows = platform() === "win32";
 const binExt = OS === "win" ? ".exe" : "";
 const bunBin = isWindows ? "bun.exe" : "bun";
 const zigBinary = OS === "win" ? "zig.exe" : "zig";
+
+console.log("building...", OS, ARCH);
 
 // Note: We want all binaries in /dist to be extensionless to simplify our cross platform code
 // (no .exe on windows)
@@ -568,7 +568,6 @@ async function copyToDist() {
 		console.log("✓ Copied WGPU shared library to dist");
 
 		// On Windows, Dawn needs d3dcompiler_47.dll for D3D shader compilation.
-		// ARM64 Windows doesn't have an x64 version in system directories,
 		// so we must bundle it alongside the WGPU library.
 		if (OS === "win") {
 			const d3dCompilerCandidates = [
@@ -634,9 +633,7 @@ async function copyToDist() {
 		await $`cp -R src/native/build/process_helper dist/process_helper`;
 	} else if (OS === "win") {
 		await $`cp src/native/win/build/libNativeWrapper.dll dist/libNativeWrapper.dll`;
-		// native system webview library - always use x64 for Windows
-		const webview2Arch = "x64";
-		await $`cp vendors/webview2/Microsoft.Web.WebView2/build/native/${webview2Arch}/WebView2Loader.dll dist/WebView2Loader.dll`;
+		await $`cp vendors/webview2/Microsoft.Web.WebView2/build/native/${ARCH}/WebView2Loader.dll dist/WebView2Loader.dll`;
 		// CEF binaries for Windows - copy ALL CEF files to cef/ subdirectory for consistent organization
 		await $`powershell -command "New-Item -ItemType Directory -Path 'dist/cef' -Force | Out-Null"`;
 		// Copy main CEF DLLs to cef/ subdirectory
@@ -747,7 +744,7 @@ async function copyToDist() {
 
 async function createPlatformDistFolder() {
 	// Create platform-specific dist folder (e.g., dist-linux-arm64)
-	const platformDistDir = `dist-${OS}-${ARCH}`;
+	const platformDistDir = `dist-${OS}-x64`;
 	console.log(`Creating platform-specific dist folder: ${platformDistDir}`);
 
 	await $`mkdir -p ${platformDistDir}`;
@@ -786,9 +783,8 @@ function getPlatform() {
 function getArch() {
 	switch (arch()) {
 		case "arm64":
-			return "arm64";
 		case "x64":
-			return "x64";
+			return "x64" as const;
 		default:
 			throw new Error("unsupported arch");
 	}
@@ -841,18 +837,16 @@ async function vendorBun() {
 	let bunUrlSegment: string;
 	let bunDirName: string;
 
+	// Use baseline x64 to ensure ARM64 compatibility
 	if (OS === "win") {
-		// Use baseline x64 for Windows to ensure ARM64 compatibility
 		bunUrlSegment = "bun-windows-x64-baseline.zip";
 		bunDirName = "bun-windows-x64-baseline";
 	} else if (OS === "macos") {
-		bunUrlSegment =
-			ARCH === "arm64" ? "bun-darwin-aarch64.zip" : "bun-darwin-x64.zip";
-		bunDirName = ARCH === "arm64" ? "bun-darwin-aarch64" : "bun-darwin-x64";
+		bunUrlSegment = "bun-darwin-x64-baseline.zip";
+		bunDirName = "bun-darwin-x64-baseline";
 	} else if (OS === "linux") {
-		bunUrlSegment =
-			ARCH === "arm64" ? "bun-linux-aarch64.zip" : "bun-linux-x64.zip";
-		bunDirName = ARCH === "arm64" ? "bun-linux-aarch64" : "bun-linux-x64";
+		bunUrlSegment = "bun-linux-x64-baseline.zip";
+		bunDirName = "bun-linux-x64-baseline";
 	} else {
 		throw new Error(`Unsupported platform: ${OS}`);
 	}
@@ -901,16 +895,14 @@ async function vendorZig() {
 		return;
 	}
 
+	// Always use x64 since we only build x64 binaries
+	const zigArch = "x86_64";
 	if (OS === "macos") {
-		const zigArch = ARCH === "arm64" ? "aarch64" : "x86_64";
 		await $`mkdir -p vendors/zig && curl -L https://ziglang.org/download/0.13.0/zig-macos-${zigArch}-0.13.0.tar.xz | tar -xJ --strip-components=1 -C vendors/zig zig-macos-${zigArch}-0.13.0/zig zig-macos-${zigArch}-0.13.0/lib  zig-macos-${zigArch}-0.13.0/doc`;
 	} else if (OS === "win") {
-		// Always use x64 for Windows since we only build x64 Windows binaries
-		const zigArch = "x86_64";
 		const zigFolder = `zig-windows-${zigArch}-0.13.0`;
 		await $`mkdir -p vendors/zig && curl -L https://ziglang.org/download/0.13.0/${zigFolder}.zip -o vendors/zig.zip && powershell -ExecutionPolicy Bypass -Command Expand-Archive -Path vendors/zig.zip -DestinationPath vendors/zig-temp && mv vendors/zig-temp/${zigFolder}/zig.exe vendors/zig && mv vendors/zig-temp/${zigFolder}/lib vendors/zig/`;
 	} else if (OS === "linux") {
-		const zigArch = ARCH === "arm64" ? "aarch64" : "x86_64";
 		await $`mkdir -p vendors/zig && curl -L https://ziglang.org/download/0.13.0/zig-linux-${zigArch}-0.13.0.tar.xz | tar -xJ --strip-components=1 -C vendors/zig zig-linux-${zigArch}-0.13.0/zig zig-linux-${zigArch}-0.13.0/lib zig-linux-${zigArch}-0.13.0/doc`;
 	}
 }
@@ -1172,9 +1164,9 @@ async function vendorAsar() {
 	};
 	const asarPlatform = asarPlatformMap[OS];
 
-	// On Windows, download both x64 and arm64 versions for development flexibility
-	// (allows testing on Windows ARM machines while shipping x64 binaries)
-	const archsToDownload = OS === "win" ? ["x64", "arm64"] : [ARCH];
+	// Download both x64 and arm64 versions for development flexibility
+	// (allows testing on ARM machines while shipping x64 binaries)
+	const archsToDownload = ["x64", "arm64"];
 
 	for (const targetArch of archsToDownload) {
 		const asarDir = OS === "win" ? join(asarBaseDir, targetArch) : asarBaseDir;
@@ -1296,7 +1288,7 @@ async function vendorCEF() {
 
 	if (OS === "macos") {
 		if (!existsSync(join(process.cwd(), "vendors", "cef"))) {
-			const cefArch = ARCH === "arm64" ? "macosarm64" : "macosx64";
+			const cefArch = "macosx64";
 			console.log(`Downloading CEF for macOS ${ARCH}...`);
 			// Try a different URL format - encode all + symbols
 			let cefUrl = `https://cef-builds.spotifycdn.com/cef_binary_${CEF_VERSION_MAC}+chromium-${CHROMIUM_VERSION_MAC}_${cefArch}_minimal.tar.bz2`;
@@ -1394,8 +1386,8 @@ async function vendorCEF() {
 			await $`mkdir -p src/native/build`;
 			// build CEF wrapper library
 			console.log("Building CEF wrapper library...");
-			const buildArch = ARCH === "arm64" ? "arm64" : "x86_64";
-			await $`cd vendors/cef && rm -rf build && mkdir -p build && cd build && "${CMAKE_BIN}" -DPROJECT_ARCH="${buildArch}" -DCMAKE_BUILD_TYPE=Release .. && make -j8 libcef_dll_wrapper`;
+			const buildArch = "x86_64";
+			await $`cd vendors/cef && rm -rf build && mkdir -p build && cd build && "${CMAKE_BIN}" -DPROJECT_ARCH="${buildArch}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release .. && make -j8 libcef_dll_wrapper`;
 
 			// Verify the wrapper library was built
 			const wrapperPath = join(
@@ -1412,9 +1404,9 @@ async function vendorCEF() {
 			console.log("CEF wrapper library built successfully");
 
 			// build helper
-			await $`clang++ -mmacosx-version-min=10.13 -std=c++20 -ObjC++ -fobjc-arc -I./vendors/cef -c src/native/macos/cef_process_helper_mac.cc -o src/native/build/process_helper_mac.o`;
+			await $`clang++ -arch x86_64 -mmacosx-version-min=10.13 -std=c++20 -ObjC++ -fobjc-arc -I./vendors/cef -c src/native/macos/cef_process_helper_mac.cc -o src/native/build/process_helper_mac.o`;
 			// link
-			await $`clang++ -mmacosx-version-min=10.13 -std=c++20 src/native/build/process_helper_mac.o -o src/native/build/process_helper -framework Cocoa -framework WebKit -framework QuartzCore -F./vendors/cef/Release -framework "Chromium Embedded Framework" -L./vendors/cef/build/libcef_dll_wrapper -lcef_dll_wrapper -stdlib=libc++`;
+			await $`clang++ -arch x86_64 -mmacosx-version-min=10.13 -std=c++20 src/native/build/process_helper_mac.o -o src/native/build/process_helper -framework Cocoa -framework WebKit -framework QuartzCore -F./vendors/cef/Release -framework "Chromium Embedded Framework" -L./vendors/cef/build/libcef_dll_wrapper -lcef_dll_wrapper -stdlib=libc++`;
 			// fix internal path
 			// Note: Can use `otool -L src/native/build/process_helper` to check the value
 			await $`install_name_tool -change "@executable_path/../Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework" "@executable_path/../../../../Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework" src/native/build/process_helper`;
@@ -1430,7 +1422,7 @@ async function vendorCEF() {
 			console.log("Downloading CEF binaries...");
 			// Always use x64 for Windows since we only build x64 Windows binaries
 			const cefArch = "windows64";
-			console.log("Downloading CEF for Windows x64...");
+			console.log(`Downloading CEF for Windows ${ARCH}...`);
 			await $`curl -L "https://cef-builds.spotifycdn.com/cef_binary_${CEF_VERSION_WIN}%2Bchromium-${CHROMIUM_VERSION_WIN}_${cefArch}_minimal.tar.bz2" -o "${tempPath}"`;
 
 			// Validate download
@@ -1552,7 +1544,7 @@ async function vendorCEF() {
 		}
 	} else if (OS === "linux") {
 		if (!existsSync(join(process.cwd(), "vendors", "cef"))) {
-			const cefArch = ARCH === "arm64" ? "linuxarm64" : "linux64";
+			const cefArch = "linux64";
 			console.log(`Downloading CEF for Linux ${ARCH}...`);
 			await $`mkdir -p vendors/cef && curl -L "https://cef-builds.spotifycdn.com/cef_binary_${CEF_VERSION_LINUX}%2Bchromium-${CHROMIUM_VERSION_LINUX}_${cefArch}_minimal.tar.bz2" | tar -xj --strip-components=1 -C vendors/cef`;
 			// Write version stamp so future builds can detect staleness
@@ -1578,32 +1570,7 @@ async function vendorCEF() {
 			console.log("Building CEF wrapper library for Linux...");
 			await $`cd vendors/cef && rm -rf build && mkdir -p build`;
 
-			if (ARCH === "arm64") {
-				// For ARM64, we need to modify CEF's cmake files to remove -m64 flags
-				console.log("Patching CEF cmake files for ARM64...");
-
-				// Replace -m64 and -march=x86-64 with ARM64 equivalents in cef_variables.cmake
-				const cefVariablesPath = join(
-					process.cwd(),
-					"vendors",
-					"cef",
-					"cmake",
-					"cef_variables.cmake",
-				);
-				if (existsSync(cefVariablesPath)) {
-					let cefVariables = readFileSync(cefVariablesPath, "utf-8");
-					cefVariables = cefVariables.replace(/-m64/g, "");
-					cefVariables = cefVariables.replace(
-						/-march=x86-64/g,
-						"-march=armv8-a",
-					);
-					writeFileSync(cefVariablesPath, cefVariables);
-				}
-
-				await $`cd vendors/cef/build && "${CMAKE_BIN}" -DCEF_USE_SANDBOX=OFF -DCMAKE_BUILD_TYPE=Release -DPROJECT_ARCH=arm64 ..`;
-			} else {
-				await $`cd vendors/cef/build && "${CMAKE_BIN}" -DCEF_USE_SANDBOX=OFF -DCMAKE_BUILD_TYPE=Release ..`;
-			}
+			await $`cd vendors/cef/build && "${CMAKE_BIN}" -DCEF_USE_SANDBOX=OFF -DCMAKE_BUILD_TYPE=Release ..`;
 
 			await $`cd vendors/cef/build && make -j$(nproc) libcef_dll_wrapper`;
 		}
@@ -1622,10 +1589,10 @@ async function vendorCEF() {
 			const cefWrapperLib = `./vendors/cef/build/libcef_dll_wrapper/libcef_dll_wrapper.a`;
 
 			// Compile the Linux helper process
-			await $`g++ -c -std=c++20 -I"${cefInclude}" -o src/native/build/process_helper_linux.o src/native/linux/cef_process_helper_linux.cpp`;
+			await $`g++ -arch x86_64 -c -std=c++20 -I"${cefInclude}" -o src/native/build/process_helper_linux.o src/native/linux/cef_process_helper_linux.cpp`;
 
 			// Link to create the helper executable
-			await $`g++ -o src/native/build/process_helper src/native/build/process_helper_linux.o "${cefWrapperLib}" "${cefLib}" -Wl,-rpath,'$ORIGIN' -lpthread -ldl`;
+			await $`g++ -arch x86_64 -o src/native/build/process_helper src/native/build/process_helper_linux.o "${cefWrapperLib}" "${cefLib}" -Wl,-rpath,'$ORIGIN' -lpthread -ldl`;
 		}
 	}
 }
@@ -1773,8 +1740,8 @@ async function buildNative() {
 		);
 		if (!existsSync(wrapperPath)) {
 			console.log("CEF wrapper library not found, building it now...");
-			const buildArch = ARCH === "arm64" ? "arm64" : "x86_64";
-			await $`cd vendors/cef && rm -rf build && mkdir -p build && cd build && "${CMAKE_BIN}" -DPROJECT_ARCH="${buildArch}" -DCMAKE_BUILD_TYPE=Release .. && make -j8 libcef_dll_wrapper`;
+			const buildArch = "x86_64";
+			await $`cd vendors/cef && rm -rf build && mkdir -p build && cd build && "${CMAKE_BIN}" -DPROJECT_ARCH="${buildArch}" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release .. && make -j8 libcef_dll_wrapper`;
 
 			if (!existsSync(wrapperPath)) {
 				throw new Error(
@@ -1793,13 +1760,12 @@ async function buildNative() {
 		const wgpuIncludeFlag = existsSync(wgpuIncludeDir)
 			? `-I${wgpuIncludeDir}`
 			: "";
-		await $`mkdir -p src/native/macos/build && clang++ -c src/native/macos/nativeWrapper.mm -o src/native/macos/build/nativeWrapper.o -fobjc-arc -fno-objc-msgsend-selector-stubs -I./vendors/cef ${wgpuIncludeFlag} -std=c++20`;
-		await $`mkdir -p src/native/build && clang++ -o src/native/build/libNativeWrapper.dylib src/native/macos/build/nativeWrapper.o ./vendors/zig-asar/libasar.dylib -framework Cocoa -framework WebKit -framework QuartzCore -framework Metal -framework MetalKit -framework UserNotifications -F./vendors/cef/Release -weak_framework 'Chromium Embedded Framework' -L./vendors/cef/build/libcef_dll_wrapper -lcef_dll_wrapper -stdlib=libc++ -shared -install_name @executable_path/libNativeWrapper.dylib -Wl,-rpath,@executable_path`;
+		await $`mkdir -p src/native/macos/build && clang++ -arch x86_64 -c src/native/macos/nativeWrapper.mm -o src/native/macos/build/nativeWrapper.o -fobjc-arc -fno-objc-msgsend-selector-stubs -I./vendors/cef ${wgpuIncludeFlag} -std=c++20`;
+		await $`mkdir -p src/native/build && clang++ -arch x86_64 -o src/native/build/libNativeWrapper.dylib src/native/macos/build/nativeWrapper.o ./vendors/zig-asar/libasar.dylib -framework Cocoa -framework WebKit -framework QuartzCore -framework Metal -framework MetalKit -framework UserNotifications -F./vendors/cef/Release -weak_framework 'Chromium Embedded Framework' -L./vendors/cef/build/libcef_dll_wrapper -lcef_dll_wrapper -stdlib=libc++ -shared -install_name @executable_path/libNativeWrapper.dylib -Wl,-rpath,@executable_path`;
 	} else if (OS === "win") {
 		const webview2Include = `./vendors/webview2/Microsoft.Web.WebView2/build/native/include`;
 		// Always use x64 for Windows since we only build x64 Windows binaries
-		const webview2Arch = "x64";
-		const webview2Lib = `./vendors/webview2/Microsoft.Web.WebView2/build/native/${webview2Arch}/WebView2LoaderStatic.lib`;
+		const webview2Lib = `./vendors/webview2/Microsoft.Web.WebView2/build/native/${ARCH}/WebView2LoaderStatic.lib`;
 		const cefInclude = `./vendors/cef`;
 		const cefLib = `./vendors/cef/Release/libcef.lib`;
 		const cefWrapperLib = `./vendors/cef/build/libcef_dll_wrapper/Release/libcef_dll_wrapper.lib`;
@@ -1819,7 +1785,7 @@ async function buildNative() {
 		// Use /MT to statically link the C runtime (matches libcpmt.lib that CEF uses)
 		await $`mkdir -p src/native/win/build`;
 		await runMsvcCommand(
-			`cl /c /EHsc /std:c++20 /DNOMINMAX /MT /I"${webview2Include}" /I"${cefInclude}" ${wgpuIncludeFlag} /D_USRDLL /D_WINDLL /Fosrc/native/win/build/nativeWrapper.obj src/native/win/nativeWrapper.cpp`,
+			`cl /c /EHsc /arch:x64 /std:c++20 /DNOMINMAX /MT /I"${webview2Include}" /I"${cefInclude}" ${wgpuIncludeFlag} /D_USRDLL /D_WINDLL /Fosrc/native/win/build/nativeWrapper.obj src/native/win/nativeWrapper.cpp`,
 		);
 
 		// Link with both WebView2 and CEF libraries using DelayLoad for CEF (similar to macOS weak linking)
@@ -1849,11 +1815,12 @@ async function buildNative() {
 		try {
 			// Always include CEF headers for Linux builds
 			const cefInclude = join(process.cwd(), "vendors", "cef");
+			const wgpuArch = "x86_64";
 			const wgpuIncludeDir = join(
 				process.cwd(),
 				"vendors",
 				"wgpu",
-				`${OS}-${ARCH}`,
+				`${OS}-${wgpuArch}`,
 				"include",
 			);
 			const cefLib = join(
@@ -1914,8 +1881,8 @@ async function buildNative() {
 					console.warn("⚠️  pkg-config failed, using fallback flags");
 					console.warn("   Error:", error);
 					// Detect architecture for correct glib path
-					const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
-					pkgConfigCflags = `-I/usr/include/gtk-3.0 -I/usr/include/webkit2gtk-4.1 -I/usr/include/glib-2.0 -I/usr/lib/${arch}-linux-gnu/glib-2.0/include -I/usr/include/pango-1.0 -I/usr/include/cairo -I/usr/include/gdk-pixbuf-2.0 -I/usr/include/atk-1.0`;
+					const glibArch = "x86_64";
+					pkgConfigCflags = `-I/usr/include/gtk-3.0 -I/usr/include/webkit2gtk-4.1 -I/usr/include/glib-2.0 -I/usr/lib/${glibArch}-linux-gnu/glib-2.0/include -I/usr/include/pango-1.0 -I/usr/include/cairo -I/usr/include/gdk-pixbuf-2.0 -I/usr/include/atk-1.0`;
 					pkgConfigLibs = "-lgtk-3 -lwebkit2gtk-4.1 -lglib-2.0 -lgobject-2.0";
 				}
 			}
@@ -2012,20 +1979,11 @@ async function buildLauncher() {
 	let zigArgs: string[] = [];
 
 	if (OS === "win") {
-		// Windows always x64 for now
 		zigArgs = ["-Dtarget=x86_64-windows", "-Dcpu=baseline"];
 	} else if (OS === "linux") {
-		if (ARCH === "arm64") {
-			zigArgs = ["-Dtarget=aarch64-linux"];
-		} else {
-			zigArgs = ["-Dtarget=x86_64-linux"];
-		}
+		zigArgs = ["-Dtarget=x86_64-linux", "-Dcpu=baseline"];
 	} else if (OS === "macos") {
-		if (ARCH === "arm64") {
-			zigArgs = ["-Dtarget=aarch64-macos"];
-		} else {
-			zigArgs = ["-Dtarget=x86_64-macos"];
-		}
+		zigArgs = ["-Dtarget=x86_64-macos", "-Dcpu=baseline"];
 	}
 
 	if (CHANNEL === "debug") {
@@ -2061,9 +2019,7 @@ async function buildSelfExtractor() {
 	const zigArgs =
 		OS === "win"
 			? ["-Dtarget=x86_64-windows", "-Dcpu=baseline"]
-			: ARCH === "x64"
-				? ["-Dcpu=baseline"]
-				: [];
+			: ["-Dcpu=baseline"];
 
 	if (CHANNEL === "debug") {
 		await $`cd src/extractor && ../../vendors/zig/zig build ${zigArgs}`;
