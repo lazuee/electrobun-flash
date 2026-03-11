@@ -74,6 +74,7 @@ const MIN_DOWNLOAD_SIZES: Record<string, number> = {
 	"zig-zstd": 100 * 1024, // zig-zstd tarball should be > 100KB
 	wgpu: 1 * 1024 * 1024, // Dawn (WGPU) tarball should be > 1MB
 	cef: 50 * 1024 * 1024, // CEF tarball should be > 50MB
+	"pepper-flash": 1 * 1024 * 1024, // PepperFlash tarball should be > 1MB
 };
 
 function validateDownload(filePath: string, type: string): void {
@@ -465,6 +466,7 @@ async function setup() {
 	await vendorZstd(); // GitHub
 	await vendorAsar(); // GitHub
 	await vendorWGPU(); // GitHub
+	await vendorPepperFlash(); // GitHub
 	await vendorZig(); // ziglang.org (not GitHub)
 	await vendorCEF(); // Spotify CDN (not GitHub)
 	await vendorWebview2();
@@ -1236,6 +1238,72 @@ async function vendorAsar() {
 				`Failed to download zig-asar binaries. Please try again in a minute.`,
 			);
 		}
+	}
+}
+
+async function vendorPepperFlash() {
+	const FLASH_VERSION = "1.0.0";
+	const flashDir = join(process.cwd(), "vendors", "pepper-flash");
+
+	// Platform-specific expected files
+	const expectedFile =
+		OS === "macos"
+			? join(flashDir, "PepperFlashPlayer.plugin")
+			: OS === "linux"
+				? join(flashDir, "libpepflashplayer.so")
+				: join(flashDir, "pepflashplayer.dll");
+
+	if (existsSync(expectedFile)) {
+		return;
+	}
+
+	await pauseForGitHub();
+	console.log("Downloading PepperFlash plugin...");
+
+	const flashPlatformMap: Record<string, string> = {
+		macos: "darwin",
+		win: "win32",
+		linux: "linux",
+	};
+	const flashPlatform = flashPlatformMap[OS];
+
+	const tempTarball = join("vendors", `pepper-flash-temp.tar.gz`);
+
+	try {
+		await $`mkdir -p vendors/pepper-flash`;
+		const tarballUrl = `https://github.com/lazuee/flashplayer-plugin/releases/download/v${FLASH_VERSION}/flashplayer-plugin-${flashPlatform}.tar.gz`;
+		console.log(`Downloading PepperFlash from: ${tarballUrl}`);
+		await $`rm -f "${tempTarball}"`;
+		const githubToken =
+			process.env["GITHUB_TOKEN"] ??
+			process.env["GH_TOKEN"] ??
+			process.env["GITHUB_ACCESS_TOKEN"];
+		if (githubToken) {
+			await $`curl -fL -H "Authorization: Bearer ${githubToken}" -H "Accept: application/octet-stream" "${tarballUrl}" -o "${tempTarball}"`;
+		} else {
+			await $`curl -fL -H "Accept: application/octet-stream" "${tarballUrl}" -o "${tempTarball}"`;
+		}
+		validateDownload(tempTarball, "pepper-flash");
+
+		await $`tar -xzf "${tempTarball}" -C vendors/pepper-flash`;
+
+		await $`rm "${tempTarball}"`;
+
+		if (!existsSync(expectedFile)) {
+			throw new Error(
+				`PepperFlash plugin not found after extraction: ${expectedFile}`,
+			);
+		}
+
+		console.log("✓ PepperFlash plugin downloaded successfully");
+	} catch (error: unknown) {
+		console.error(
+			"Failed to download PepperFlash plugin:",
+			error instanceof Error ? error.message : error,
+		);
+		throw new Error(
+			`Failed to download PepperFlash plugin. Please try again in a minute.`,
+		);
 	}
 }
 
