@@ -209,6 +209,7 @@ export const native = (() => {
 					FFIType.function, // internalBridgeHandler: *const fn (u32, [*:0]const u8) callconv(.C) void (internal RPC, disabled in sandbox)
 					FFIType.cstring, // electrobunPreloadScript
 					FFIType.cstring, // customPreloadScript
+					FFIType.cstring, // viewsRoot
 					FFIType.bool, // transparent
 					FFIType.bool, // sandbox - when true, bunBridge and internalBridge are not set up
 					FFIType.bool, // disableGPU
@@ -1087,6 +1088,7 @@ export const ffi = {
 			html: string | null;
 			partition: string | null;
 			preload: string | null;
+			viewsRoot: string | null;
 			frame: {
 				x: number;
 				y: number;
@@ -1112,6 +1114,7 @@ export const ffi = {
 				// html: string | null;
 				partition,
 				preload,
+				viewsRoot,
 				frame: { x, y, width, height },
 				autoResize,
 				sandbox,
@@ -1206,6 +1209,7 @@ window.bunBridge ||
 				internalBridgeHandler, // Internal RPC bridge (disabled in sandbox mode)
 				toCString(electrobunPreload),
 				toCString(customPreload || ""),
+				toCString(viewsRoot || ""),
 				transparent,
 				sandbox, // When true, bunBridge and internalBridge are not set up in native code
 				disableGPU,
