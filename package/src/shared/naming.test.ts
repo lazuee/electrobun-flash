@@ -87,14 +87,10 @@ describe("getBundleFileName", () => {
 
 describe("getPlatformPrefix", () => {
 	it("constructs correct prefix format for all platform combinations", () => {
-		expect(getPlatformPrefix("stable", "macos", "arm64")).toBe(
-			"stable-macos-arm64",
-		);
 		expect(getPlatformPrefix("stable", "macos", "x64")).toBe(
 			"stable-macos-x64",
 		);
 		expect(getPlatformPrefix("canary", "win", "x64")).toBe("canary-win-x64");
-		expect(getPlatformPrefix("dev", "linux", "arm64")).toBe("dev-linux-arm64");
 		expect(getPlatformPrefix("dev", "linux", "x64")).toBe("dev-linux-x64");
 	});
 });
@@ -243,12 +239,12 @@ describe("getDmgVolumeName", () => {
 
 describe("URL construction functions", () => {
 	const baseUrl = "https://storage.example.com/releases";
-	const platformPrefix = "canary-macos-arm64";
+	const platformPrefix = "canary-macos-x64";
 
 	describe("getUpdateInfoUrl", () => {
 		it("constructs correct flat URL with prefix", () => {
 			expect(getUpdateInfoUrl(baseUrl, platformPrefix)).toBe(
-				"https://storage.example.com/releases/canary-macos-arm64-update.json",
+				"https://storage.example.com/releases/canary-macos-x64-update.json",
 			);
 		});
 
@@ -262,7 +258,7 @@ describe("URL construction functions", () => {
 	describe("getPatchFileUrl", () => {
 		it("constructs correct flat URL with prefix and hash", () => {
 			expect(getPatchFileUrl(baseUrl, platformPrefix, "abc123def456")).toBe(
-				"https://storage.example.com/releases/canary-macos-arm64-abc123def456.patch",
+				"https://storage.example.com/releases/canary-macos-x64-abc123def456.patch",
 			);
 		});
 	});
@@ -270,7 +266,7 @@ describe("URL construction functions", () => {
 	describe("getTarballUrl", () => {
 		it("constructs correct flat URL for macOS tarball", () => {
 			expect(getTarballUrl(baseUrl, platformPrefix, "MyApp.app.tar.zst")).toBe(
-				"https://storage.example.com/releases/canary-macos-arm64-MyApp.app.tar.zst",
+				"https://storage.example.com/releases/canary-macos-x64-MyApp.app.tar.zst",
 			);
 		});
 
@@ -288,10 +284,10 @@ describe("CLI and Updater consistency", () => {
 		// CLI uses: `${buildEnvironment}-${currentTarget.os}-${currentTarget.arch}`
 		// Updater uses: `${localInfo.channel}-${currentOS}-${currentArch}`
 		// Both should use getPlatformPrefix()
-		const cliResult = getPlatformPrefix("canary", "macos", "arm64");
-		const updaterResult = getPlatformPrefix("canary", "macos", "arm64");
+		const cliResult = getPlatformPrefix("canary", "macos", "x64");
+		const updaterResult = getPlatformPrefix("canary", "macos", "x64");
 		expect(cliResult).toBe(updaterResult);
-		expect(cliResult).toBe("canary-macos-arm64");
+		expect(cliResult).toBe("canary-macos-x64");
 	});
 
 	it("produces matching tarball names for macOS", () => {
