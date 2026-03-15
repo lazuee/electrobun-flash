@@ -1150,7 +1150,6 @@ export const ffi = {
 				dynamicPreload = `
 window.__electrobunWebviewId = ${id};
 window.__electrobunWindowId = ${windowId};
-Gemini said
 window.__electrobunEventBridge = window.__electrobunEventBridge ||
 (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.eventBridge) ||
 window.eventBridge ||
