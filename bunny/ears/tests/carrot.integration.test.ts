@@ -20,7 +20,7 @@ import type { PreparedCarrotInstall } from "../src/bun/carrotStore";
 import { toBunWorkerPermissions } from "../src/bun/workerPermissions";
 
 const EARS_ROOT = resolve(import.meta.dir, "..");
-const CARROTS_ROOT = resolve(EARS_ROOT, "..", "carrots");
+const TEST_CARROTS_ROOT = resolve(EARS_ROOT, "..", "test-carrots");
 const DASH_ROOT = resolve(EARS_ROOT, "..", "dash");
 const PACKAGE_ROOT = resolve(EARS_ROOT, "..", "..", "package");
 const COLAB_GOLDFISHDB_ROOT = resolve(
@@ -233,7 +233,7 @@ function seedDashTestDb(db: ReturnType<typeof createDashTestDb>) {
 }
 
 async function buildCarrot(id: string) {
-  const sourceDir = join(CARROTS_ROOT, id);
+  const sourceDir = join(TEST_CARROTS_ROOT, id);
   return buildCarrotAt(sourceDir, `bunny-ears-${id}-build-`);
 }
 
@@ -264,6 +264,8 @@ async function startBuiltCarrot(
   options?: {
     runtimeDir?: string;
     keepRuntime?: boolean;
+    initContext?: Record<string, unknown>;
+    dependencyInitContext?: Record<string, Record<string, unknown>>;
     setupRuntime?: (args: { runtimeDir: string; statePath: string; logsPath: string }) => void | Promise<void>;
   },
 ): Promise<RunningCarrot> {
@@ -288,6 +290,10 @@ async function startBuiltCarrot(
   const fakeWindowFrames = new Map<
     string,
     { x: number; y: number; width: number; height: number }
+  >();
+  const dependencyCarrots = new Map<
+    string,
+    { carrot: RunningCarrot; stopped: { value: boolean } }
   >();
 
   const queue: CarrotWorkerMessage[] = [];
@@ -336,7 +342,86 @@ async function startBuiltCarrot(
     });
   }
 
-  worker.onmessage = (event: MessageEvent<CarrotWorkerMessage>) => {
+  function withSourceEnvelope(
+    sourceCarrotId: string,
+    sourceWindowId: string | undefined,
+    payload: unknown,
+  ) {
+    const source = {
+      carrotId: sourceCarrotId,
+      windowId: sourceWindowId ?? null,
+    };
+
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+      return {
+        ...(payload as Record<string, unknown>),
+        __source: source,
+      };
+    }
+
+    return {
+      value: payload,
+      __source: source,
+    };
+  }
+
+  async function ensureDependencyCarrot(carrotId: string) {
+    const existing = dependencyCarrots.get(carrotId);
+    if (existing) {
+      return existing.carrot;
+    }
+
+    const specifier = built.manifest.dependencies?.[carrotId];
+    if (!specifier || !specifier.startsWith("file:")) {
+      throw new Error(`Missing local file dependency specifier for ${carrotId}`);
+    }
+
+    const dependencySourceDir = resolve(built.sourceDir, specifier.slice("file:".length));
+    const dependencyBuilt = await buildCarrotAt(
+      dependencySourceDir,
+      `bunny-ears-${carrotId.replace(/[^a-z0-9]+/gi, "-")}-dep-build-`,
+    );
+    const dependencyCarrot = await startBuiltCarrot(dependencyBuilt, undefined, {
+      initContext: options?.dependencyInitContext?.[carrotId],
+    });
+    const stopped = { value: false };
+
+    dependencyCarrots.set(carrotId, {
+      carrot: dependencyCarrot,
+      stopped,
+    });
+
+    const forwardEvents = async () => {
+      while (!stopped.value) {
+        try {
+          const action = await dependencyCarrot.nextAction("emit-carrot-event");
+          const payload = action.payload as
+            | {
+                carrotId?: string;
+                name?: string;
+                payload?: unknown;
+              }
+            | undefined;
+          if (!payload?.name || payload.carrotId !== built.manifest.id) {
+            continue;
+          }
+
+          worker.postMessage({
+            type: "event",
+            name: payload.name,
+            payload: withSourceEnvelope(carrotId, undefined, payload.payload),
+          } satisfies CarrotWorkerMessage);
+        } catch {
+          return;
+        }
+      }
+    };
+
+    void forwardEvents();
+    return dependencyCarrot;
+  }
+
+  worker.onmessage = async (event: MessageEvent<CarrotWorkerMessage>) => {
     if (isHostRequestMessage(event.data)) {
       const method = event.data.method as string;
       let payload: unknown = null;
@@ -371,6 +456,31 @@ async function startBuiltCarrot(
         case "clipboard-write-text":
           payload = true;
           break;
+        case "invoke-carrot": {
+          try {
+            const request = event.data.params as
+              | {
+                  carrotId?: string;
+                  method?: string;
+                  params?: unknown;
+                  windowId?: string;
+                }
+              | undefined;
+            const target = await ensureDependencyCarrot(String(request?.carrotId || ""));
+            payload = await target.request(
+              String(request?.method || ""),
+              withSourceEnvelope(
+                built.manifest.id,
+                request?.windowId,
+                request?.params,
+              ),
+            );
+          } catch (invokeError) {
+            success = false;
+            error = invokeError instanceof Error ? invokeError.message : String(invokeError);
+          }
+          break;
+        }
         default:
           success = false;
           error = `Unknown host request: ${method}`;
@@ -450,12 +560,17 @@ async function startBuiltCarrot(
       logsPath,
       permissions: flattenCarrotPermissions(grantedPermissions),
       grantedPermissions,
+      config: options?.initContext,
     },
   } satisfies CarrotWorkerMessage);
 
   await nextMessage((message) => message.type === "ready");
 
   const cleanup = () => {
+    for (const dependency of dependencyCarrots.values()) {
+      dependency.stopped.value = true;
+      dependency.carrot.cleanup();
+    }
     worker.terminate();
     if (!options?.keepRuntime) {
       rmSync(runtimeDir, { recursive: true, force: true });
@@ -509,6 +624,7 @@ async function startBuiltCarrot(
 describe("Bunny Ears carrots", () => {
   test("permission consent requests enumerate requested host and Bun permissions", () => {
     const prepared: PreparedCarrotInstall = {
+      preparedDir: "/tmp/consent-test",
       manifest: {
         id: "consent-test",
         name: "Consent Test",
@@ -545,7 +661,7 @@ describe("Bunny Ears carrots", () => {
       devMode: true,
       lastBuildAt: Date.now(),
       currentHash: null,
-      install: () => {
+      install: async () => {
         throw new Error("not used");
       },
       cleanup: () => {},
@@ -567,6 +683,7 @@ describe("Bunny Ears carrots", () => {
       isolation: "shared-worker",
     });
     const prepared: PreparedCarrotInstall = {
+      preparedDir: "/tmp/consent-match",
       manifest: {
         id: "consent-match",
         name: "Consent Match",
@@ -605,7 +722,7 @@ describe("Bunny Ears carrots", () => {
       devMode: true,
       lastBuildAt: Date.now(),
       currentHash: null,
-      install: () => {
+      install: async () => {
         throw new Error("not used");
       },
       cleanup: () => {},
@@ -728,12 +845,17 @@ describe("Bunny Ears carrots", () => {
   test("Bunny Dash builds from source and exposes a Colab-shaped shell snapshot", async () => {
     const built = await buildCarrotAt(DASH_ROOT, "bunny-ears-dash-build-");
     expect(built.manifest.id).toBe("bunny-dash");
-    expect(existsSync(join(built.outDir, "ivde", "index.js"))).toBe(true);
-    expect(existsSync(join(built.outDir, "ivde", "index.css"))).toBe(true);
+    expect(built.manifest.dependencies).toEqual({
+      "bunny.pty": "file:../foundation-carrots/pty",
+      "bunny.search": "file:../foundation-carrots/search",
+      "bunny.git": "file:../foundation-carrots/git",
+    });
+    expect(existsSync(join(built.outDir, "lens", "index.js"))).toBe(true);
+    expect(existsSync(join(built.outDir, "lens", "index.css"))).toBe(true);
     expect(existsSync(join(built.outDir, "worker.js"))).toBe(true);
-    expect(built.manifest.view.relativePath).toBe("ivde/index.html");
-    const html = await Bun.file(join(built.outDir, "ivde", "index.html")).text();
-    expect(html).toContain('href="views://ivde/index.css"');
+    expect(built.manifest.view.relativePath).toBe("lens/index.html");
+    const html = await Bun.file(join(built.outDir, "lens", "index.html")).text();
+    expect(html).toContain('href="views://lens/index.css"');
 
     const carrot = await startBuiltCarrot(built);
     const initialApplicationMenu = await carrot.nextAction("set-application-menu");
@@ -994,10 +1116,48 @@ describe("Bunny Ears carrots", () => {
       description: "Saved from the Acme workspace.",
     })) as {
       currentLens: { id: string; name: string };
+      currentWindow: { id: string };
       lenses: Array<{ id: string; name: string }>;
     };
     expect(savedLens.currentLens.name).toBe("Acme Sprint");
     expect(savedLens.lenses.some((lens) => lens.name === "Acme Sprint")).toBe(true);
+
+    const firstSuggestedLensName = (await carrot.request("getUniqueLensName", {
+      workspaceId: createdWorkspace.currentWorkspace.id,
+      baseName: "Lens",
+    })) as string;
+    expect(firstSuggestedLensName).toBe("Lens 1");
+
+    const createdLensOne = (await carrot.request("createLens", {
+      workspaceId: createdWorkspace.currentWorkspace.id,
+      name: firstSuggestedLensName,
+    })) as {
+      currentLens: { id: string; name: string };
+      lenses: Array<{ id: string; name: string }>;
+    };
+    expect(createdLensOne.currentLens.name).toBe("Lens 1");
+    expect(createdLensOne.lenses.some((lens) => lens.name === "Lens 1")).toBe(true);
+
+    const secondSuggestedLensName = (await carrot.request("getUniqueLensName", {
+      workspaceId: createdWorkspace.currentWorkspace.id,
+      baseName: "Lens",
+    })) as string;
+    expect(secondSuggestedLensName).toBe("Lens 2");
+
+    const renamedLens = (await carrot.request("renameLens", {
+      lensId: createdLensOne.currentLens.id,
+      name: "Focus",
+      description: "Renamed lens.",
+    })) as {
+      currentLens: { id: string; name: string };
+      lenses: Array<{ id: string; name: string; description: string }>;
+    };
+    expect(renamedLens.currentLens.name).toBe("Focus");
+    expect(
+      renamedLens.lenses.some(
+        (lens) => lens.id === createdLensOne.currentLens.id && lens.name === "Focus",
+      ),
+    ).toBe(true);
 
     const syncedState = (await carrot.request("getInitialState")) as {
       workspace: {
@@ -1214,25 +1374,52 @@ describe("Bunny Ears carrots", () => {
 
     carrot.postEvent("context-menu-clicked", {
       action: "lens_fork",
-      data: { lensId: savedLens.currentLens.id },
+      data: {
+        lensId: savedLens.currentLens.id,
+        windowId: savedLens.currentWindow.id,
+      },
     });
-    await carrot.nextAction(
-      "log",
+    const forkSettings = await carrot.nextAction(
+      "emit-view",
       (message) =>
-        typeof (message.payload as { message?: string } | undefined)?.message === "string" &&
-        (message.payload as { message: string }).message.includes("lens forked:"),
+        (message.payload as { name?: string; payload?: { mode?: string; sourceLensId?: string; name?: string } } | undefined)
+          ?.name === "showLensSettings" &&
+        (message.payload as { windowId?: string } | undefined)?.windowId ===
+          savedLens.currentWindow.id &&
+        (message.payload as { payload?: { sourceLensId?: string } } | undefined)?.payload?.sourceLensId ===
+          savedLens.currentLens.id,
     );
-    const forkedLensState = (await carrot.request("getSnapshot")) as {
+    expect((forkSettings.payload as { payload: { mode: string; name: string } }).payload.mode).toBe(
+      "create",
+    );
+    expect((forkSettings.payload as { payload: { name: string } }).payload.name).toBe(
+      "Acme Sprint Copy",
+    );
+
+    const createdForkedLens = (await carrot.request("createLens", {
+      workspaceId: createdWorkspace.currentWorkspace.id,
+      sourceLensId: savedLens.currentLens.id,
+      name: "Acme Sprint Copy",
+      description: "Forked from Acme Sprint",
+    })) as {
       lenses: Array<{ id: string; name: string }>;
     };
-    expect(forkedLensState.lenses.some((lens) => lens.name === "Acme Sprint Copy")).toBe(true);
+    expect(createdForkedLens.lenses.some((lens) => lens.name === "Acme Sprint Copy")).toBe(true);
 
-    const forkedLens = forkedLensState.lenses.find((lens) => lens.name === "Acme Sprint Copy");
+    const forkedLens = createdForkedLens.lenses.find((lens) => lens.name === "Acme Sprint Copy");
     expect(forkedLens).toBeTruthy();
     carrot.postEvent("context-menu-clicked", {
       action: "lens_delete",
-      data: { lensId: forkedLens!.id },
+      data: {
+        lensId: forkedLens!.id,
+        windowId: savedLens.currentWindow.id,
+      },
     });
+    await carrot.nextAction(
+      "emit-view",
+      (message) =>
+        (message.payload as { name?: string } | undefined)?.name === "refreshBunnyDashState",
+    );
     await carrot.nextAction(
       "log",
       (message) =>
@@ -1319,9 +1506,9 @@ describe("Bunny Ears carrots", () => {
     );
   }, 20000);
 
-  test("Bunny Dash exposes the Colab PTY terminal backend", async () => {
+  test("Bunny Dash uses bunny.pty as its terminal backend dependency", async () => {
     const built = await buildCarrotAt(DASH_ROOT, "bunny-ears-dash-terminal-build-");
-    expect(existsSync(join(built.outDir, process.platform === "win32" ? "colab-pty.exe" : "colab-pty"))).toBe(true);
+    expect(existsSync(join(built.outDir, process.platform === "win32" ? "pty.exe" : "pty"))).toBe(false);
 
     const carrot = await startBuiltCarrot(built);
     await carrot.nextAction("set-tray");
@@ -1341,6 +1528,413 @@ describe("Bunny Ears carrots", () => {
         (message.payload as { payload?: { terminalId?: string } } | undefined)?.payload?.terminalId === terminalId,
     );
     expect((output.payload as { name: string }).name).toBe("terminalOutput");
+
+    const cwd = (await carrot.request("getTerminalCwd", { terminalId })) as string | null;
+    expect(cwd).toBe(realpathSync(tmpdir()));
+
+    const killed = (await carrot.request("killTerminal", { terminalId })) as boolean;
+    expect(killed).toBe(true);
+  }, 20000);
+
+  test("Bunny Dash kills PTY sessions when replacing the current window state", async () => {
+    const built = await buildCarrotAt(DASH_ROOT, "bunny-ears-dash-terminal-cleanup-build-");
+    const carrot = await startBuiltCarrot(built);
+    await carrot.nextAction("set-tray");
+    await carrot.nextAction("set-tray-menu");
+
+    const terminalId = (await carrot.request("createTerminal", {
+      cwd: tmpdir(),
+    })) as string;
+    expect(typeof terminalId).toBe("string");
+
+    await carrot.nextAction(
+      "emit-view",
+      (message) =>
+        (message.payload as { name?: string; payload?: { terminalId?: string } } | undefined)
+          ?.name === "terminalOutput" &&
+        (message.payload as { payload?: { terminalId?: string } } | undefined)?.payload?.terminalId === terminalId,
+    );
+
+    await carrot.request("createWorkspace", {
+      name: "Workspace 2",
+      subtitle: "Cleanup test workspace",
+    });
+
+    const cleanupLog = await carrot.nextAction(
+      "log",
+      (message) =>
+        String((message.payload as { message?: string } | undefined)?.message || "").includes(
+          "killed 1 PTY terminal(s) for window",
+        ),
+    );
+    expect(String((cleanupLog.payload as { message?: string } | undefined)?.message || "")).toContain(
+      "killed 1 PTY terminal(s) for window",
+    );
+  }, 20000);
+
+  test("Bunny PTY carrot builds from source and emits terminal events for client carrots", async () => {
+    const built = await buildCarrotAt(
+      resolve(EARS_ROOT, "..", "foundation-carrots", "pty"),
+      "bunny-ears-pty-build-",
+    );
+    expect(built.manifest.id).toBe("bunny.pty");
+    expect(
+      existsSync(join(built.outDir, process.platform === "win32" ? "pty.exe" : "pty")),
+    ).toBe(true);
+
+    const carrot = await startBuiltCarrot(built);
+
+    const terminalId = (await carrot.request("createTerminal", {
+      cwd: tmpdir(),
+      __source: {
+        carrotId: "dash-client",
+        windowId: "main",
+      },
+    })) as string;
+    expect(typeof terminalId).toBe("string");
+    expect(terminalId.length).toBeGreaterThan(0);
+
+    const output = await carrot.nextAction(
+      "emit-carrot-event",
+      (message) =>
+        (message.payload as { carrotId?: string; name?: string; payload?: { terminalId?: string } } | undefined)
+          ?.carrotId === "dash-client" &&
+        (message.payload as { name?: string } | undefined)?.name === "pty-terminal-output" &&
+        (message.payload as { payload?: { terminalId?: string } } | undefined)?.payload?.terminalId === terminalId,
+    );
+    expect((output.payload as { name: string }).name).toBe("pty-terminal-output");
+
+    const cwd = (await carrot.request("getTerminalCwd", { terminalId })) as string | null;
+    expect(cwd).toBe(realpathSync(tmpdir()));
+
+    const killed = (await carrot.request("killTerminal", { terminalId })) as boolean;
+    expect(killed).toBe(true);
+  }, 20000);
+
+  test("Bunny Search carrot builds from source and emits search results for client carrots", async () => {
+    const built = await buildCarrotAt(
+      resolve(EARS_ROOT, "..", "foundation-carrots", "search"),
+      "bunny-ears-search-build-",
+    );
+    expect(built.manifest.id).toBe("bunny.search");
+    expect(
+      existsSync(join(built.outDir, process.platform === "win32" ? "rg.exe" : "rg")),
+    ).toBe(true);
+
+    const carrot = await startBuiltCarrot(built);
+    const projectDir = makeTempDir("bunny-search-project-");
+    mkdirSync(join(projectDir, "src"), { recursive: true });
+    mkdirSync(join(projectDir, "packages", "demo", ".git"), { recursive: true });
+    writeFileSync(join(projectDir, "README.md"), "magic-needle in readme\n");
+    writeFileSync(join(projectDir, "src", "needle.ts"), "export const needleValue = 'magic-needle';\n");
+
+    const ownerSource = {
+      carrotId: "dash-client",
+      windowId: "main",
+    };
+
+    const findAllResponse = (await carrot.request("findAllInWorkspace", {
+      query: "magic-needle",
+      targets: [{ projectId: "project-1", path: projectDir }],
+      __source: ownerSource,
+    })) as Array<unknown>;
+    expect(findAllResponse).toEqual([]);
+
+    const findAllEvent = await carrot.nextAction(
+      "emit-carrot-event",
+      (message) =>
+        (message.payload as { carrotId?: string; name?: string; payload?: { projectId?: string } } | undefined)
+          ?.carrotId === "dash-client" &&
+        (message.payload as { name?: string } | undefined)?.name === "search-find-all-results" &&
+        (message.payload as { payload?: { projectId?: string } } | undefined)?.payload?.projectId === "project-1",
+    );
+    expect((findAllEvent.payload as { name?: string } | undefined)?.name).toBe(
+      "search-find-all-results",
+    );
+
+    const findFilesResponse = (await carrot.request("findFilesInWorkspace", {
+      query: "needle.ts",
+      targets: [{ projectId: "project-1", path: projectDir }],
+      __source: ownerSource,
+    })) as Array<unknown>;
+    expect(findFilesResponse).toEqual([]);
+
+    const findFilesEvent = await carrot.nextAction(
+      "emit-carrot-event",
+      (message) =>
+        (message.payload as { carrotId?: string; name?: string; payload?: { projectId?: string; results?: string[] } } | undefined)
+          ?.carrotId === "dash-client" &&
+        (message.payload as { name?: string } | undefined)?.name === "search-find-files-results" &&
+        (message.payload as { payload?: { projectId?: string } } | undefined)?.payload?.projectId === "project-1",
+    );
+    expect((findFilesEvent.payload as { name?: string } | undefined)?.name).toBe(
+      "search-find-files-results",
+    );
+    expect(
+      ((findFilesEvent.payload as { payload?: { results?: string[] } } | undefined)?.payload?.results || []).some(
+        (result) => result.endsWith("needle.ts"),
+      ),
+    ).toBe(true);
+
+    const nestedGitRepo = (await carrot.request("findFirstNestedGitRepo", {
+      searchPath: projectDir,
+      timeoutMs: 2_000,
+    })) as string | null;
+    expect(String(nestedGitRepo || "").replace(/[\\/]+$/, "")).toBe(
+      join(projectDir, "packages", "demo", ".git"),
+    );
+  }, 20000);
+
+  test("Bunny Dash uses bunny.search as its workspace search backend", async () => {
+    const built = await buildCarrotAt(DASH_ROOT, "bunny-ears-dash-search-build-");
+    const carrot = await startBuiltCarrot(built);
+    const projectDir = makeTempDir("bunny-dash-search-project-");
+    mkdirSync(join(projectDir, "src"), { recursive: true });
+    writeFileSync(join(projectDir, "README.md"), "dash-search-needle in readme\n");
+    writeFileSync(join(projectDir, "src", "needle.ts"), "export const dashSearchNeedle = true;\n");
+
+    await carrot.nextAction("set-tray");
+    await carrot.nextAction("set-tray-menu");
+
+    const createdWorkspace = (await carrot.request("createWorkspace", {
+      name: "Search Workspace",
+      subtitle: "Workspace search wiring test.",
+    })) as {
+      currentWorkspace: { id: string };
+    };
+
+    await carrot.request("addProjectMount", {
+      workspaceId: createdWorkspace.currentWorkspace.id,
+      name: "search-project",
+      path: projectDir,
+    });
+
+    const initialState = (await carrot.request("getInitialState")) as {
+      projects: Array<{ id: string; path: string }>;
+    };
+    const searchProject = initialState.projects.find((project) => project.path === projectDir);
+    expect(searchProject).toBeTruthy();
+
+    const findAllResponse = (await carrot.request("findAllInWorkspace", {
+      query: "dash-search-needle",
+    })) as Array<unknown>;
+    expect(findAllResponse).toEqual([]);
+
+    const findAllEvent = await carrot.nextAction(
+      "emit-view",
+      (message) =>
+        (message.payload as { name?: string; payload?: { query?: string; results?: Array<{ path?: string }> } } | undefined)
+          ?.name === "findAllInFolderResult" &&
+        (message.payload as { payload?: { query?: string } } | undefined)?.payload?.query ===
+          "dash-search-needle",
+    );
+    expect((findAllEvent.payload as { name?: string } | undefined)?.name).toBe(
+      "findAllInFolderResult",
+    );
+    expect((findAllEvent.payload as { raw?: boolean } | undefined)?.raw).toBe(false);
+    expect(
+      (findAllEvent.payload as { payload?: { projectId?: string } } | undefined)?.payload?.projectId,
+    ).toBe(searchProject?.id);
+
+    const findFilesResponse = (await carrot.request("findFilesInWorkspace", {
+      query: "needle.ts",
+    })) as Array<unknown>;
+    expect(findFilesResponse).toEqual([]);
+
+    const findFilesEvent = await carrot.nextAction(
+      "emit-view",
+      (message) =>
+        (message.payload as { name?: string; payload?: { query?: string; results?: string[] } } | undefined)
+          ?.name === "findFilesInWorkspaceResult" &&
+        (message.payload as { payload?: { query?: string } } | undefined)?.payload?.query === "needle.ts",
+    );
+    expect((findFilesEvent.payload as { name?: string } | undefined)?.name).toBe(
+      "findFilesInWorkspaceResult",
+    );
+    expect((findFilesEvent.payload as { raw?: boolean } | undefined)?.raw).toBe(false);
+    expect(
+      (findFilesEvent.payload as { payload?: { projectId?: string } } | undefined)?.payload?.projectId,
+    ).toBe(searchProject?.id);
+    expect(
+      ((findFilesEvent.payload as { payload?: { results?: string[] } } | undefined)?.payload?.results || []).some(
+        (result) => result.endsWith("needle.ts"),
+      ),
+    ).toBe(true);
+  }, 20000);
+
+  test("Bunny PTY carrot kills orphaned terminals after the heartbeat timeout", async () => {
+    const built = await buildCarrotAt(
+      resolve(EARS_ROOT, "..", "foundation-carrots", "pty"),
+      "bunny-ears-pty-heartbeat-build-",
+    );
+    const worker = new Worker(join(built.outDir, built.manifest.worker.relativePath), {
+      type: "module",
+      permissions: toBunWorkerPermissions(normalizeCarrotPermissions(built.manifest.permissions)),
+    });
+    const workerCleanup = () => worker.terminate();
+    cleanups.add(workerCleanup);
+
+        const queue: CarrotWorkerMessage[] = [];
+        const waiters: Array<{
+          predicate: (message: CarrotWorkerMessage) => boolean;
+          resolve: (message: CarrotWorkerMessage) => void;
+          timer: ReturnType<typeof setTimeout>;
+        }> = [];
+
+        function flushQueue() {
+          for (let index = 0; index < waiters.length; index += 1) {
+            const waiter = waiters[index];
+            const queueIndex = queue.findIndex(waiter.predicate);
+            if (queueIndex === -1) {
+              continue;
+            }
+            const [message] = queue.splice(queueIndex, 1);
+            waiters.splice(index, 1);
+            clearTimeout(waiter.timer);
+            waiter.resolve(message);
+            index -= 1;
+          }
+        }
+
+        function nextMessage(
+          predicate: (message: CarrotWorkerMessage) => boolean,
+          timeoutMs = 5000,
+        ) {
+          const queueIndex = queue.findIndex(predicate);
+          if (queueIndex !== -1) {
+            return Promise.resolve(queue.splice(queueIndex, 1)[0]);
+          }
+
+          return new Promise<CarrotWorkerMessage>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              const waiterIndex = waiters.findIndex((waiter) => waiter.resolve === resolve);
+              if (waiterIndex !== -1) {
+                waiters.splice(waiterIndex, 1);
+              }
+              reject(new Error("Timed out waiting for PTY worker message"));
+            }, timeoutMs);
+            waiters.push({ predicate, resolve, timer });
+          });
+        }
+
+    worker.onmessage = (event: MessageEvent<CarrotWorkerMessage>) => {
+      queue.push(event.data);
+      flushQueue();
+    };
+
+    worker.postMessage({
+      type: "init",
+      manifest: built.manifest,
+      context: {
+        statePath: join(built.outDir, "state.json"),
+        logsPath: join(built.outDir, "logs.txt"),
+        permissions: flattenCarrotPermissions(normalizeCarrotPermissions(built.manifest.permissions)),
+        grantedPermissions: normalizeCarrotPermissions(built.manifest.permissions),
+        config: {
+          ptyHeartbeatTimeoutMs: 1000,
+          ptyHeartbeatSweepMs: 250,
+        },
+      },
+    } satisfies CarrotWorkerMessage);
+    await nextMessage((message) => message.type === "ready");
+
+    worker.postMessage({
+      type: "request",
+      requestId: 1,
+      method: "createTerminal",
+      params: {
+        cwd: tmpdir(),
+        __source: {
+          carrotId: "dash-client",
+          windowId: "main",
+        },
+      },
+    } satisfies CarrotWorkerMessage);
+
+    const createResponse = (await nextMessage(
+      (message) => isResponseMessage(message) && message.requestId === 1,
+    )) as WorkerResponseMessage;
+    expect(createResponse.success).toBe(true);
+    const terminalId = String(createResponse.payload || "");
+
+    await nextMessage(
+      (message) =>
+        isActionMessage(message) &&
+        message.action === "emit-carrot-event" &&
+        (message.payload as { carrotId?: string; name?: string; payload?: { terminalId?: string } } | undefined)
+          ?.carrotId === "dash-client" &&
+        (message.payload as { name?: string } | undefined)?.name === "pty-terminal-output" &&
+        (message.payload as { payload?: { terminalId?: string } } | undefined)?.payload?.terminalId === terminalId,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+
+    worker.postMessage({
+      type: "request",
+      requestId: 2,
+      method: "sweepExpiredTerminals",
+      params: {},
+    } satisfies CarrotWorkerMessage);
+
+    const sweepResponse = (await nextMessage(
+      (message) => isResponseMessage(message) && message.requestId === 2,
+    )) as WorkerResponseMessage;
+    expect(sweepResponse.success).toBe(true);
+    expect(
+      [0, 1].includes(
+        Number((sweepResponse.payload as { killedCount?: number } | undefined)?.killedCount ?? -1),
+      ),
+    ).toBe(true);
+
+    worker.postMessage({
+      type: "request",
+      requestId: 3,
+      method: "getTerminalCwd",
+      params: {
+        terminalId,
+      },
+    } satisfies CarrotWorkerMessage);
+
+    const cwdResponse = (await nextMessage(
+      (message) => isResponseMessage(message) && message.requestId === 3,
+    )) as WorkerResponseMessage;
+    expect(cwdResponse.success).toBe(true);
+    const cwd = cwdResponse.payload as string | null;
+    expect(cwd).toBeNull();
+
+    cleanups.delete(workerCleanup);
+    workerCleanup();
+  }, 20000);
+
+  test("Bunny Dash renews PTY heartbeats for active terminal sessions", async () => {
+    const built = await buildCarrotAt(DASH_ROOT, "bunny-ears-dash-terminal-heartbeat-build-");
+    const carrot = await startBuiltCarrot(built, undefined, {
+      initContext: {
+        ptyHeartbeatIntervalMs: 1000,
+      },
+      dependencyInitContext: {
+        "bunny.pty": {
+          ptyHeartbeatTimeoutMs: 2000,
+          ptyHeartbeatSweepMs: 250,
+        },
+      },
+    });
+    await carrot.nextAction("set-tray");
+    await carrot.nextAction("set-tray-menu");
+
+    const terminalId = (await carrot.request("createTerminal", {
+      cwd: tmpdir(),
+    })) as string;
+    expect(typeof terminalId).toBe("string");
+
+    await carrot.nextAction(
+      "emit-view",
+      (message) =>
+        (message.payload as { name?: string; payload?: { terminalId?: string } } | undefined)
+          ?.name === "terminalOutput" &&
+        (message.payload as { payload?: { terminalId?: string } } | undefined)?.payload?.terminalId === terminalId,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 3500));
 
     const cwd = (await carrot.request("getTerminalCwd", { terminalId })) as string | null;
     expect(cwd).toBe(realpathSync(tmpdir()));

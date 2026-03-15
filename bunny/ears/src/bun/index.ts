@@ -39,7 +39,12 @@ import {
 } from "./carrotConsent";
 import { toBunWorkerPermissions } from "./workerPermissions";
 
+const DEBUG_BUNNY_EARS_BOOT = process.env.BUNNY_EARS_BOOT_DEBUG === "1";
+
 function bootLog(message: string, details?: unknown) {
+  if (!DEBUG_BUNNY_EARS_BOOT) {
+    return;
+  }
   if (details === undefined) {
     console.log(`[bunny-ears:boot] ${message}`);
     return;
@@ -400,6 +405,7 @@ class CarrotInstance {
     if (this.logs.length > 24) {
       this.logs.splice(0, this.logs.length - 24);
     }
+    console.log(`[carrot:${this.carrot.manifest.id}] ${message}`);
     runtime.notifyDashboardChanged();
   }
 
@@ -610,6 +616,24 @@ class CarrotInstance {
         }
         return win.getFrame();
       }
+      case "invoke-carrot": {
+        const invokePayload =
+          params && typeof params === "object"
+            ? (params as {
+                carrotId?: string;
+                method?: string;
+                params?: unknown;
+                windowId?: string;
+              })
+            : {};
+        return (runtime as any).invokeCarrotFrom(
+          this.carrot.manifest.id,
+          String(invokePayload.carrotId || ""),
+          String(invokePayload.method || ""),
+          invokePayload.params,
+          typeof invokePayload.windowId === "string" ? invokePayload.windowId : undefined,
+        );
+      }
       case "screen-get-primary-display": {
         return Screen.getPrimaryDisplay();
       }
@@ -813,6 +837,23 @@ class CarrotInstance {
             (target?.webview.rpc as any)?.send?.runtimeEvent(eventPayload);
           }
         }
+        break;
+      }
+      case "emit-carrot-event": {
+        const eventPayload =
+          payload && typeof payload === "object"
+            ? (payload as {
+                carrotId?: string;
+                name?: string;
+                payload?: unknown;
+              })
+            : {};
+        (runtime as any).emitCarrotEventFrom(
+          this.carrot.manifest.id,
+          String(eventPayload.carrotId || ""),
+          String(eventPayload.name || ""),
+          eventPayload.payload,
+        );
         break;
       }
       case "log": {
@@ -1097,6 +1138,80 @@ class BunnyEarsRuntime {
     this.restoreDefaultApplicationMenu();
   }
 
+  private withSourceEnvelope(
+    sourceCarrotId: string,
+    sourceWindowId: string | undefined,
+    payload: unknown,
+  ) {
+    const source = {
+      carrotId: sourceCarrotId,
+      windowId: sourceWindowId ?? null,
+    };
+
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+      return {
+        ...(payload as Record<string, unknown>),
+        __source: source,
+      };
+    }
+
+    return {
+      value: payload,
+      __source: source,
+    };
+  }
+
+  async invokeCarrotFrom(
+    sourceCarrotId: string,
+    targetCarrotId: string,
+    method: string,
+    params?: unknown,
+    sourceWindowId?: string,
+  ) {
+    if (!targetCarrotId) {
+      throw new Error("Missing target carrot id");
+    }
+    if (!method) {
+      throw new Error("Missing target carrot method");
+    }
+
+    const target = this.carrots.get(targetCarrotId);
+    if (!target) {
+      throw new Error(`Target carrot not installed: ${targetCarrotId}`);
+    }
+
+    const wasStopped = target.status === "stopped";
+    if (target.status !== "running") {
+      await target.start();
+      if (wasStopped && target.carrot.manifest.mode === "background") {
+        target.sendEvent("boot");
+      }
+    }
+
+    return target.invoke(
+      method,
+      this.withSourceEnvelope(sourceCarrotId, sourceWindowId, params),
+    );
+  }
+
+  emitCarrotEventFrom(
+    sourceCarrotId: string,
+    targetCarrotId: string,
+    name: string,
+    payload?: unknown,
+  ) {
+    if (!targetCarrotId || !name) {
+      return;
+    }
+
+    const target = this.carrots.get(targetCarrotId);
+    if (!target || target.status !== "running") {
+      return;
+    }
+
+    target.sendEvent(name, this.withSourceEnvelope(sourceCarrotId, undefined, payload));
+  }
+
   private buildTrayMenu() {
     const summaries = this.summaries();
     const carrotItems = summaries.map((carrot) => ({
@@ -1153,7 +1268,7 @@ class BunnyEarsRuntime {
     options: { preserveRunningState?: boolean } = {},
   ) {
     try {
-      const installed = prepared.install(grantedPermissions);
+      const installed = await prepared.install(grantedPermissions);
       await this.upsertInstalledCarrot(installed, {
         openWindow: installed.manifest.mode === "window",
         preserveRunningState: options.preserveRunningState,
@@ -1521,4 +1636,3 @@ if (refreshErrors.length > 0) {
 
 const runtime = new BunnyEarsRuntime();
 await runtime.boot();
-console.log("[bunny-ears] runtime booted");

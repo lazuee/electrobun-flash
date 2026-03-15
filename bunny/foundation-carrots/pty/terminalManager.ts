@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+const PTY_BINARY_NAME = process.platform === "win32" ? "pty.exe" : "pty";
+
 export type TerminalMessage =
   | {
       type: "terminalOutput";
@@ -79,10 +81,7 @@ export class TerminalManager {
           : "/bin/bash";
     const terminalShell = shell || process.env.SHELL || defaultShell;
     const workerDir = dirname(fileURLToPath(import.meta.url));
-    const ptyBinaryPath = join(
-      workerDir,
-      process.platform === "win32" ? "colab-pty.exe" : "colab-pty",
-    );
+    const ptyBinaryPath = join(workerDir, PTY_BINARY_NAME);
 
     const proc = spawn([ptyBinaryPath], {
       stdin: "pipe",

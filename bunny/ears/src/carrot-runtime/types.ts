@@ -47,12 +47,15 @@ export type CarrotPermissionConsentRequest = {
 
 export type CarrotMode = "window" | "background";
 
+export type CarrotDependencyMap = Record<string, string>;
+
 export type CarrotManifest = {
   id: string;
   name: string;
   version: string;
   description: string;
   mode: CarrotMode;
+  dependencies?: CarrotDependencyMap;
   permissions: CarrotPermissionGrant;
   view: {
     relativePath: string;
@@ -131,6 +134,7 @@ export type WorkerInitMessage = {
     logsPath: string;
     permissions: CarrotPermissionTag[];
     grantedPermissions: CarrotPermissionGrant;
+    config?: Record<string, unknown>;
   };
 };
 
@@ -154,6 +158,7 @@ export type HostActionMessage = {
     | "open-manager"
     | "stop-carrot"
     | "emit-view"
+    | "emit-carrot-event"
     | "log";
   payload?: unknown;
 };
@@ -167,6 +172,7 @@ export type HostRequestMessage = {
     | "show-item-in-folder"
     | "clipboard-write-text"
     | "window-get-frame"
+    | "invoke-carrot"
     | "screen-get-primary-display"
     | "screen-get-cursor-screen-point";
   params?: unknown;

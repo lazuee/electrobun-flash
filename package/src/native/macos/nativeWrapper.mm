@@ -651,9 +651,7 @@ NSData* readViewsFile(const char* viewsUrl) {
         std::call_once(g_asarArchiveInitFlag, [asarPath]() {
             const char* asarPathCStr = [asarPath UTF8String];
             g_asarArchive = asar_open(asarPathCStr);
-            if (g_asarArchive) {
-                NSLog(@"DEBUG readViewsFile: Opened ASAR archive at %@", asarPath);
-            } else {
+            if (!g_asarArchive) {
                 NSLog(@"ERROR readViewsFile: Failed to open ASAR archive at %@", asarPath);
             }
         });
@@ -668,15 +666,11 @@ NSData* readViewsFile(const char* viewsUrl) {
             const uint8_t* fileData = asar_read_file(g_asarArchive, asarFilePathCStr, &fileSize);
 
             if (fileData && fileSize > 0) {
-                NSLog(@"DEBUG readViewsFile: Read %zu bytes from ASAR for %@", fileSize, relativePath);
                 // Create NSData that copies the buffer (we'll free it after)
                 NSData *data = [NSData dataWithBytes:fileData length:fileSize];
                 // Free the ASAR buffer
                 asar_free_buffer(fileData, fileSize);
                 return data;
-            } else {
-                NSLog(@"DEBUG readViewsFile: File not found in ASAR: %@", relativePath);
-                // Fall through to flat file reading
             }
         }
     }
@@ -684,9 +678,6 @@ NSData* readViewsFile(const char* viewsUrl) {
     // Fallback: Read from flat file system (for non-ASAR builds or missing files)
     NSString *viewsDir = [resourcesDir stringByAppendingPathComponent:@"app/views"];
     NSString *filePath = [viewsDir stringByAppendingPathComponent:relativePath];
-
-    NSLog(@"DEBUG readViewsFile: Attempting flat file read: %@", filePath);
-    NSLog(@"DEBUG readViewsFile: file exists=%@", [[NSFileManager defaultManager] fileExistsAtPath:filePath] ? @"YES" : @"NO");
 
     // Read the file
     return [NSData dataWithContentsOfFile:filePath];
@@ -714,9 +705,6 @@ NSData* readViewsFileWithRoot(const char* viewsUrl, NSString *viewsRoot) {
         NSLog(@"ERROR readViewsFileWithRoot: path escapes root %@ -> %@", normalizedRoot, candidatePath);
         return nil;
     }
-
-    NSLog(@"DEBUG readViewsFileWithRoot: Attempting rooted read: %@", candidatePath);
-    NSLog(@"DEBUG readViewsFileWithRoot: file exists=%@", [[NSFileManager defaultManager] fileExistsAtPath:candidatePath] ? @"YES" : @"NO");
 
     return [NSData dataWithContentsOfFile:candidatePath];
 }
@@ -1935,25 +1923,18 @@ static void schedulePendingResizeDrain() {
         NSString *urlString = url.absoluteString;
         
         if ([urlString hasPrefix:@"views://"]) {
-            NSLog(@"DEBUG WKWebView: Processing views:// URL: %@", urlString);
             NSString *relativePath = normalizeViewsRelativePath(urlString);
-            NSLog(@"DEBUG WKWebView: relativePath = '%@'", relativePath);
 
             if ([relativePath isEqualToString:@"internal/index.html"]) {
                 // For internal content, call the native HTML resolver.
-                NSLog(@"DEBUG: Handling views://internal/index.html for webview %u", self.webviewId);
                 // Use stored HTML content instead of JSCallback
                 contentPtr = getWebviewHTMLContent(self.webviewId);
                 if (!contentPtr) {
                     // Fallback to default if no content set
-                    NSLog(@"DEBUG: No HTML content found for webview %u, using fallback", self.webviewId);
                     contentPtr = strdup("<html><body>No content set</body></html>");
-                } else {
-                    NSLog(@"DEBUG: Retrieved HTML content for webview %u", self.webviewId);
                 }
                 if (contentPtr) {
                     contentLength = strlen(contentPtr);
-                    NSLog(@"DEBUG WKWebView: HTML content length: %zu, content preview: %.100s", contentLength, contentPtr);
                     data = [NSData dataWithBytes:contentPtr length:contentLength];
                 } else {
                     // Handle NULL content gracefully
@@ -1964,15 +1945,11 @@ static void schedulePendingResizeDrain() {
                     return;
                 }
             } else {
-                NSLog(@"DEBUG WKWebView: Attempting to read views file: %@", urlString);
                 data = readViewsFileWithRoot(urlString.UTF8String, self.viewsRoot);
                 
                 if (data) {
-                    NSLog(@"DEBUG WKWebView: Successfully read views file, length: %lu", (unsigned long)data.length);
                     contentPtr = (const char *)data.bytes;
                     contentLength = data.length;
-                } else {
-                    NSLog(@"DEBUG WKWebView: Failed to read views file: %@", urlString);
                 }
             } 
         } else {
@@ -1984,7 +1961,6 @@ static void schedulePendingResizeDrain() {
             std::string urlStr = [urlString UTF8String];
             std::string detectedMimeType = getMimeTypeFromUrl(urlStr);
             const char *mimeTypePtr = strdup(detectedMimeType.c_str());
-            NSLog(@"DEBUG WKWebView: Set MIME type '%s' for URL: %@", detectedMimeType.c_str(), urlString);
             
             NSString *rawMimeType = mimeTypePtr ? [NSString stringWithUTF8String:mimeTypePtr] : @"application/octet-stream";
 
@@ -2002,11 +1978,9 @@ static void schedulePendingResizeDrain() {
                                                     MIMEType:mimeType
                                         expectedContentLength:contentLength
                                             textEncodingName:encodingName];
-            NSLog(@"DEBUG WKWebView: Sending response with MIME type: %@, encoding: %@", mimeType, encodingName);
             [urlSchemeTask didReceiveResponse:response];
             [urlSchemeTask didReceiveData:data];
             [urlSchemeTask didFinish];
-            NSLog(@"DEBUG WKWebView: Response sent successfully");
             
             // Clean up memory
             if (mimeTypePtr) {
@@ -2023,7 +1997,6 @@ static void schedulePendingResizeDrain() {
        
     }
     - (void)webView:(WKWebView *)webView stopURLSchemeTask:(id<WKURLSchemeTask>)urlSchemeTask {
-        NSLog(@"Stopping URL scheme task for URL: %@", urlSchemeTask.request.URL);
     }
 @end
 
@@ -2032,7 +2005,6 @@ static void schedulePendingResizeDrain() {
     decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction
     decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
         NSURL *newURL = navigationAction.request.URL;
-        NSLog(@"DEBUG WKWebView Navigation: webview %u navigating to %@", self.webviewId, newURL.absoluteString);
 
         // Check if cmd key is held - if so, fire event and block navigation
         BOOL isCmdClick = (navigationAction.modifierFlags & NSEventModifierFlagCommand) != 0;
@@ -2611,12 +2583,8 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
                 }
 
                 // Only load URL if it's provided and no HTML content exists
-                NSLog(@"DEBUG WKWebView Constructor: URL check - url=%p, url='%s', strlen=%zu", url, url ? url : "NULL", url ? strlen(url) : 0);
                 if (url && strlen(url) > 0) {                                   
-                    NSLog(@"DEBUG WKWebView Constructor: Loading initial URL: %s", url);
                     [self loadURL:url];
-                } else {
-                    NSLog(@"DEBUG WKWebView Constructor: Skipping URL load - no URL or empty URL");
                 } 
                 
                 // associate
@@ -2688,7 +2656,6 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
 
     - (void)remove {
         if (!self.webView) {
-            NSLog(@"WKWebViewImpl remove: webView is already nil for webview %u", self.webviewId);
             return;
         }
 
@@ -2697,8 +2664,6 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
 
         // Dispatch all cleanup to main queue since WKWebView operations require it
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSLog(@"WKWebViewImpl remove: cleaning up webview %u on main queue", webviewIdForLogging);
-
             [webViewToClean stopLoading];
 
             // Remove KVO observer
@@ -2732,8 +2697,6 @@ runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
 
             // Load about:blank to force WebKit to release the WebContent process
             [webViewToClean loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]]];
-
-            NSLog(@"WKWebViewImpl remove: COMPLETED cleanup for webview %u", webviewIdForLogging);
         });
 
         // Release our strong reference immediately so the main queue block
@@ -6740,14 +6703,12 @@ extern "C" void startEventLoop(const char* identifier, const char* name, const c
     // Initialize the global AbstractView tracking map
     if (!globalAbstractViews) {
         globalAbstractViews = [[NSMutableDictionary alloc] init];
-        NSLog(@"Initialized global AbstractView tracking map");
     }
     
     // Initialize webview HTML content storage
     if (!webviewHTMLContent) {
         webviewHTMLContent = [[NSMutableDictionary alloc] init];
         webviewHTMLLock = [[NSLock alloc] init];
-        NSLog(@"Initialized webview HTML content storage");
     }
     
     // Set up dispatch sources for SIGINT and SIGTERM so they work regardless of
@@ -7144,22 +7105,15 @@ extern "C" void webviewReload(AbstractView *abstractView) {
 }
 
 extern "C" void webviewRemove(AbstractView *abstractView) {
-    NSLog(@"webviewRemove: ENTRY - abstractView=%p", abstractView);
-    
     if (!abstractView) {
-        NSLog(@"webviewRemove: abstractView is null - EXITING");
         return;
     }
-    
-    NSLog(@"webviewRemove: webviewId=%u, globalAbstractViews=%p, count=%lu", 
-          abstractView.webviewId, globalAbstractViews, globalAbstractViews ? (unsigned long)globalAbstractViews.count : 0);
-    
+
     // Check global tracking map instead of individual flag
     NSNumber *webviewKey = @(abstractView.webviewId);
     AbstractView *trackedView = globalAbstractViews[webviewKey];
     
     if (!trackedView) {
-        NSLog(@"webviewRemove: webview %u not found in global tracking, already removed - EXITING", abstractView.webviewId);
         return;
     }
     
@@ -7169,12 +7123,7 @@ extern "C" void webviewRemove(AbstractView *abstractView) {
     
     // Remove from global tracking immediately to prevent re-entry
     [globalAbstractViews removeObjectForKey:webviewKey];
-    NSLog(@"webviewRemove: Removed webview %u from global tracking (remaining: %lu)", 
-          abstractView.webviewId, (unsigned long)globalAbstractViews.count);
-    
-    NSLog(@"webviewRemove: About to call [abstractView remove] for webview %u", abstractView.webviewId);
     [abstractView remove];
-    NSLog(@"webviewRemove: COMPLETED for webview %u", abstractView.webviewId);
 }
 
 extern "C" BOOL webviewCanGoBack(AbstractView *abstractView) {
@@ -8382,8 +8331,6 @@ extern "C" void setJSUtils(GetMimeType getMimeType, GetHTMLForWebviewSync getHTM
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_DEFAULT, 0);
     jsWorkerQueue = dispatch_queue_create("com.electrobun.jsworker", attr);    
 
-    NSLog(@"setJSUtils called but using map-based approach instead of callbacks");
-    
 }
 
 // MARK: - Webview HTML Content Management (replaces JSCallback approach)

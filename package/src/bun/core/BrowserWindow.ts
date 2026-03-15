@@ -247,8 +247,6 @@ export class BrowserWindow<T extends RPCWithTransport = RPCWithTransport> {
 			startPassthrough: this.passthrough,
 		});
 
-		console.log("setting webviewId: ", webview.id);
-
 		this.webviewId = webview.id;
 	}
 

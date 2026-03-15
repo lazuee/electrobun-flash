@@ -12,7 +12,15 @@ import {
   type FSWatcher,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { ApplicationMenu, BrowserWindow, ContextMenu, Tray, Utils, app } from "electrobun/bun";
+import {
+  ApplicationMenu,
+  BrowserWindow,
+  Carrots,
+  ContextMenu,
+  Tray,
+  Utils,
+  app,
+} from "electrobun/bun";
 import {
   createDashDb,
   type DashDb,
@@ -22,7 +30,6 @@ import {
   type LensWindow,
   type WindowTabId,
 } from "./db";
-import { TerminalManager } from "./terminalManager";
 
 type ColabPane =
   | {
@@ -216,7 +223,6 @@ let permissions = new Set<string>();
 let dashDb: DashDb | null = null;
 let manifestVersion = "0.0.1";
 let runtimeWindows: LensWindow[] = [];
-let terminalManager: TerminalManager | null = null;
 const browserWindows = new Map<string, BrowserWindow>();
 let tray: Tray | null = null;
 const terminalWindowOwners = new Map<string, string>();
@@ -224,8 +230,13 @@ const expandedFsDirs = new Set<string>();
 const directoryWatchers = new Map<string, FSWatcher>();
 const framePersistTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+let ptyHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 const LIVE_WINDOW_ID_SEPARATOR = "::";
 const WORKSPACE_CURRENT_LENS_PREFIX = "__workspace-current__:";
+const PTY_CARROT_ID = "bunny.pty";
+const SEARCH_CARROT_ID = "bunny.search";
+const DEFAULT_PTY_HEARTBEAT_INTERVAL_MS = 60 * 1000;
+let ptyHeartbeatIntervalMs = DEFAULT_PTY_HEARTBEAT_INTERVAL_MS;
 const LEGACY_CURRENT_SESSION_MAIN_TABS: WindowTabId[] = [
   "workspace",
   "projects",
@@ -424,6 +435,14 @@ function sleep(ms: number) {
   });
 }
 
+function parseDurationMs(value: unknown, fallback: number, minimum: number) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(minimum, parsed);
+}
+
 function getOrCreateBrowserWindow(windowId = state.currentWindowId, title?: string) {
   const runtimeWindow = runtimeWindows.find((candidate) => candidate.id === windowId);
   if (!runtimeWindow) {
@@ -442,7 +461,7 @@ function getOrCreateBrowserWindow(windowId = state.currentWindowId, title?: stri
   const win = new BrowserWindow({
     id: windowId,
     title: title || runtimeWindow.title,
-    url: "views://ivde/index.html",
+    url: "views://lens/index.html",
     titleBarStyle: "hiddenInset",
     frame: {
       x: colabWindow?.position.x ?? 120,
@@ -534,52 +553,116 @@ function sendToDashWindow(windowId: string | undefined, name: string, payload?: 
   emitViewMessage(name, payload, windowId || state.currentWindowId);
 }
 
-async function forkLens(lensId: string) {
-  const lens = getLensByKey(lensId);
-  const lenses = listLenses();
-  const isCurrentLens = lens.key === getLensIdForWindow(getCurrentWindow());
-  const sourceWindow = isCurrentLens ? getCurrentWindow() : null;
-  if (isCurrentLens && sourceWindow) {
-    await syncRuntimeWindowFrameFromHost(sourceWindow.id);
-  }
-  const sourceColabWindow = isCurrentLens ? getCurrentColabWindow() : parseStoredColabWindow(lens);
-  const cleanName = uniqueKey(`${lens.name} Copy`, lenses.map((existing) => existing.name))
-    .replace(/-/g, " ")
-    .replace(/\b\w/g, (match) => match.toUpperCase());
-  const key = uniqueKey(cleanName, lenses.map((existing) => existing.key));
-
-  const created = ensureDb().collection("layouts").insert({
-    key,
-    name: cleanName,
-    description: lens.description?.trim() || `Forked from ${lens.name}`,
-    workspaceId: getLensWorkspaceId(lens),
-    windowStateJson: serializeColabWindow(sourceColabWindow),
-    sortOrder: lenses.length,
-    windows: [sourceWindow ? toLensTemplateWindow(sourceWindow) : structuredClone(lens.windows[0] || DEFAULT_STARTER_LENS_WINDOW)],
+function sendRuntimeEventToDashWindow(windowId: string | undefined, name: string, payload?: unknown) {
+  post({
+    type: "action",
+    action: "emit-view",
+    payload: {
+      name,
+      payload,
+      raw: false,
+      windowId: windowId || state.currentWindowId,
+    },
   });
+}
 
-  flushDb();
-  await saveState();
-  syncTray();
-  emitSetProjectsForWindow(getCurrentWindow().id);
-  emitSnapshot();
-  log(`lens forked: ${created.name}`);
-  return snapshot();
+function broadcastRuntimeEventToDashWindows(name: string, payload?: unknown) {
+  post({
+    type: "action",
+    action: "emit-view",
+    payload: { raw: false, name, payload },
+  });
+}
+
+function getUniqueLensNameForWorkspace(workspaceId: string, baseName = "Lens", excludeLensId?: string) {
+  const existingNames = new Set(
+    getLensesForWorkspace(workspaceId)
+      .filter((lens) => lens.key !== excludeLensId)
+      .map((lens) => lens.name.trim().toLowerCase()),
+  );
+
+  let index = 1;
+  while (existingNames.has(`${baseName} ${index}`.toLowerCase())) {
+    index += 1;
+  }
+
+  return `${baseName} ${index}`;
+}
+
+function getUniqueLensDisplayName(workspaceId: string, rawName: string, excludeLensId?: string) {
+  const trimmed = rawName.trim();
+  if (!trimmed) {
+    return getUniqueLensNameForWorkspace(workspaceId, "Lens", excludeLensId);
+  }
+
+  const existingNames = new Set(
+    getLensesForWorkspace(workspaceId)
+      .filter((lens) => lens.key !== excludeLensId)
+      .map((lens) => lens.name.trim().toLowerCase()),
+  );
+
+  if (!existingNames.has(trimmed.toLowerCase())) {
+    return trimmed;
+  }
+
+  let index = 2;
+  let candidate = `${trimmed} ${index}`;
+  while (existingNames.has(candidate.toLowerCase())) {
+    index += 1;
+    candidate = `${trimmed} ${index}`;
+  }
+  return candidate;
 }
 
 async function handleContextMenuAction(action: string, data: any) {
   const windowId = typeof data?.windowId === "string" ? data.windowId : state.currentWindowId;
+  if (windowId) {
+    setActiveWindow(windowId);
+  }
 
   switch (action) {
+    case "workspace_new_lens":
+      sendRuntimeEventToDashWindow(windowId, "showLensSettings", {
+        mode: "create",
+        workspaceId: String(data?.workspaceId || getCurrentWorkspace().key),
+        name: getUniqueLensNameForWorkspace(
+          String(data?.workspaceId || getCurrentWorkspace().key),
+          "Lens",
+        ),
+        description: "",
+      });
+      return;
     case "workspace_open_in_new_window":
       await openWorkspaceInNewWindow(String(data?.workspaceId || getCurrentWorkspace().key));
       return;
     case "lens_open_in_new_window":
       await openLensInNewWindow(String(data?.lensId || state.currentLayoutId));
       return;
-    case "lens_fork":
-      await forkLens(String(data?.lensId || state.currentLayoutId));
+    case "lens_rename": {
+      const lens = getLensByKey(String(data?.lensId || state.currentLayoutId));
+      sendRuntimeEventToDashWindow(windowId, "showLensSettings", {
+        mode: "rename",
+        workspaceId: getLensWorkspaceId(lens),
+        lensId: lens.key,
+        name: lens.name,
+        description: lens.description || "",
+      });
       return;
+    }
+    case "lens_fork": {
+      const lens = getLensByKey(String(data?.lensId || state.currentLayoutId));
+      sendRuntimeEventToDashWindow(windowId, "showLensSettings", {
+        mode: "create",
+        workspaceId: getLensWorkspaceId(lens),
+        sourceLensId: lens.key,
+        name: getUniqueLensDisplayName(
+          getLensWorkspaceId(lens),
+          `${lens.name} Copy`,
+        ),
+        description: lens.description?.trim() || `Forked from ${lens.name}`,
+      });
+      return;
+    }
     case "lens_delete":
       await deleteLens(String(data?.lensId || state.currentLayoutId));
       return;
@@ -940,7 +1023,11 @@ function ensureDb() {
 }
 
 function initializeRuntimeContext(message?: {
-  context?: { permissions?: string[]; statePath?: string };
+  context?: {
+    permissions?: string[];
+    statePath?: string;
+    config?: { ptyHeartbeatIntervalMs?: unknown };
+  };
   manifest?: { version?: string };
 }) {
   permissions = new Set(
@@ -949,6 +1036,12 @@ function initializeRuntimeContext(message?: {
   );
   statePath = message?.context?.statePath || app.statePath || statePath;
   manifestVersion = message?.manifest?.version || app.manifest?.version || manifestVersion;
+  ptyHeartbeatIntervalMs = parseDurationMs(
+    message?.context?.config?.ptyHeartbeatIntervalMs ??
+      process.env.BUNNY_DASH_PTY_HEARTBEAT_INTERVAL_MS,
+    ptyHeartbeatIntervalMs,
+    1_000,
+  );
 }
 
 function ensureBootPromise() {
@@ -957,6 +1050,7 @@ function ensureBootPromise() {
       await loadState();
       ensureRuntimeState();
       currentState = captureCurrentState();
+      ensurePtyHeartbeatLoop();
       syncApplicationMenu();
       await reopenRuntimeWindowsOnBoot();
       post({ type: "ready" });
@@ -998,6 +1092,13 @@ ContextMenu.on("context-menu-clicked", (payload) => {
     (payload as { data?: { data?: unknown } } | undefined)?.data?.data ??
     {};
   void handleContextMenuAction(action, data);
+});
+
+process.on("exit", () => {
+  if (ptyHeartbeatTimer) {
+    clearInterval(ptyHeartbeatTimer);
+    ptyHeartbeatTimer = null;
+  }
 });
 
 function flushDb() {
@@ -1364,28 +1465,210 @@ function emitViewMessage(name: string, payload?: unknown, windowId?: string) {
   });
 }
 
-function getTerminalManager() {
-  if (!terminalManager) {
-    terminalManager = new TerminalManager((message) => {
-      const targetWindowId = terminalWindowOwners.get(message.terminalId);
-      if (message.type === "terminalOutput") {
-        emitViewMessage("terminalOutput", {
-          terminalId: message.terminalId,
-          data: message.data,
-        }, targetWindowId);
-      } else if (message.type === "terminalExit") {
-        emitViewMessage("terminalExit", {
-          terminalId: message.terminalId,
-          exitCode: message.exitCode,
-          signal: message.signal,
-        }, targetWindowId);
-        terminalWindowOwners.delete(message.terminalId);
-      }
-    });
+function handlePtyTerminalOutput(payload: unknown) {
+  const eventPayload =
+    payload && typeof payload === "object"
+      ? (payload as {
+          terminalId?: string;
+          data?: string;
+          windowId?: string | null;
+        })
+      : {};
+  const terminalId = String(eventPayload.terminalId || "");
+  if (!terminalId) {
+    return;
   }
 
-  return terminalManager;
+  const targetWindowId =
+    typeof eventPayload.windowId === "string" && eventPayload.windowId.length > 0
+      ? eventPayload.windowId
+      : terminalWindowOwners.get(terminalId);
+  if (targetWindowId) {
+    terminalWindowOwners.set(terminalId, targetWindowId);
+  }
+
+  emitViewMessage(
+    "terminalOutput",
+    {
+      terminalId,
+      data: String(eventPayload.data || ""),
+    },
+    targetWindowId,
+  );
 }
+
+function handlePtyTerminalExit(payload: unknown) {
+  const eventPayload =
+    payload && typeof payload === "object"
+      ? (payload as {
+          terminalId?: string;
+          exitCode?: number;
+          signal?: number;
+          windowId?: string | null;
+        })
+      : {};
+  const terminalId = String(eventPayload.terminalId || "");
+  if (!terminalId) {
+    return;
+  }
+
+  const targetWindowId =
+    typeof eventPayload.windowId === "string" && eventPayload.windowId.length > 0
+      ? eventPayload.windowId
+      : terminalWindowOwners.get(terminalId);
+  emitViewMessage(
+    "terminalExit",
+    {
+      terminalId,
+      exitCode: Number(eventPayload.exitCode || 0),
+      signal: Number(eventPayload.signal || 0),
+    },
+    targetWindowId,
+  );
+  log(`PTY carrot terminal exited ${terminalId}`);
+  terminalWindowOwners.delete(terminalId);
+}
+
+async function killTerminalSession(terminalId: string) {
+  if (!terminalId) {
+    return;
+  }
+
+  try {
+    await invokePtyCarrot<boolean>("killTerminal", {
+      terminalId,
+    });
+  } catch (error) {
+    log(
+      `failed to kill PTY terminal ${terminalId}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  } finally {
+    terminalWindowOwners.delete(terminalId);
+  }
+}
+
+async function killTerminalsForWindow(windowId: string) {
+  const terminalIds = Array.from(terminalWindowOwners.entries())
+    .filter(([, ownerWindowId]) => ownerWindowId === windowId)
+    .map(([terminalId]) => terminalId);
+
+  if (terminalIds.length === 0) {
+    return;
+  }
+
+  await Promise.all(terminalIds.map((terminalId) => killTerminalSession(terminalId)));
+  log(`killed ${terminalIds.length} PTY terminal(s) for window ${windowId}`);
+}
+
+async function invokePtyCarrot<T = unknown>(
+  method: string,
+  params?: unknown,
+  options?: { windowId?: string },
+) {
+  return Carrots.invoke<T>(PTY_CARROT_ID, method, params, options);
+}
+
+async function invokeSearchCarrot<T = unknown>(
+  method: string,
+  params?: unknown,
+  options?: { windowId?: string },
+) {
+  return Carrots.invoke<T>(SEARCH_CARROT_ID, method, params, options);
+}
+
+function buildSearchTargetsForWorkspace(workspaceId = getCurrentWorkspace().key) {
+  return getProjectMountsForWorkspace(workspaceId).map((project) => ({
+    projectId: project.key,
+    path: project.path,
+  }));
+}
+
+async function heartbeatPtyTerminals() {
+  const terminalIds = Array.from(terminalWindowOwners.keys());
+  if (terminalIds.length === 0) {
+    return;
+  }
+
+  try {
+    await invokePtyCarrot<{ refreshedCount: number }>("heartbeatTerminals", {
+      terminalIds,
+    });
+  } catch {
+    // Ignore heartbeat failures here. Explicit terminal calls will still surface errors.
+  }
+}
+
+function ensurePtyHeartbeatLoop() {
+  if (ptyHeartbeatTimer) {
+    return;
+  }
+
+  ptyHeartbeatTimer = setInterval(() => {
+    void heartbeatPtyTerminals();
+  }, ptyHeartbeatIntervalMs);
+}
+
+function handleSearchFindAllResults(payload: unknown) {
+  const eventPayload =
+    payload && typeof payload === "object"
+      ? (payload as {
+          query?: string;
+          projectId?: string;
+          results?: Array<{ path?: string; line?: number; column?: number; match?: string }>;
+          windowId?: string | null;
+        })
+      : {};
+
+  const targetWindowId =
+    typeof eventPayload.windowId === "string" ? eventPayload.windowId : state.currentWindowId;
+
+  sendRuntimeEventToDashWindow(
+    targetWindowId,
+    "findAllInFolderResult",
+    {
+      query: String(eventPayload.query || ""),
+      projectId: String(eventPayload.projectId || ""),
+      results: Array.isArray(eventPayload.results)
+        ? eventPayload.results.map((result) => ({
+            path: String(result?.path || ""),
+            line: Number(result?.line || 0),
+            column: Number(result?.column || 0),
+            match: String(result?.match || ""),
+          }))
+        : [],
+    },
+  );
+}
+
+function handleSearchFindFilesResults(payload: unknown) {
+  const eventPayload =
+    payload && typeof payload === "object"
+      ? (payload as {
+          query?: string;
+          projectId?: string;
+          results?: string[];
+          windowId?: string | null;
+        })
+      : {};
+
+  const targetWindowId =
+    typeof eventPayload.windowId === "string" ? eventPayload.windowId : state.currentWindowId;
+
+  sendRuntimeEventToDashWindow(
+    targetWindowId,
+    "findFilesInWorkspaceResult",
+    {
+      query: String(eventPayload.query || ""),
+      projectId: String(eventPayload.projectId || ""),
+      results: Array.isArray(eventPayload.results) ? eventPayload.results.map(String) : [],
+    },
+  );
+}
+
+app.on("pty-terminal-output", handlePtyTerminalOutput);
+app.on("pty-terminal-exit", handlePtyTerminalExit);
 
 function emitSetProjectsForWindow(windowId: string) {
   const runtimeWindow = runtimeWindows.find((window) => window.id === windowId);
@@ -2082,7 +2365,7 @@ function buildTab(
         kind: "notes",
         icon: "›_",
         body:
-          "Terminal sessions will move into a dedicated PTY carrot so Bunny Dash can attach locally or remotely without SSH. This is the future colab-pty path.",
+          "Terminal sessions will move into a dedicated PTY carrot so Bunny Dash can attach locally or remotely without SSH. This is the future pty path.",
       };
     case "agent":
       return {
@@ -2548,6 +2831,7 @@ async function restoreLensInCurrentWindow(lensId: string) {
     `restoreLensInCurrentWindow begin: ${lens.key} rootPane=${savedWindowState.rootPane.type} currentPane=${savedWindowState.currentPaneId}`,
   );
   const currentWindow = getCurrentWindow();
+  await killTerminalsForWindow(currentWindow.id);
   const restoredWindow = buildRuntimeWindowFromLens(lens, currentWindow.id);
 
   currentWindow.title = restoredWindow.title;
@@ -2686,6 +2970,82 @@ async function overwriteCurrentLens() {
   log(`lens overwritten: ${lens.name}`);
 }
 
+async function createLens(
+  workspaceId: string,
+  name: string,
+  description = "",
+  sourceLensId?: string,
+) {
+  const workspace = getWorkspaceByKey(workspaceId);
+  const lenses = listLenses();
+  const cleanName = getUniqueLensDisplayName(workspace.key, name);
+  const key = uniqueKey(cleanName, lenses.map((lens) => lens.key));
+  const currentWindow = getCurrentWindow();
+  const sourceLens = sourceLensId ? getLensByKey(sourceLensId) : null;
+  const useCurrentWindowState =
+    !sourceLens && currentWindow.workspaceId === workspace.key;
+
+  let sourceColabWindow: ColabWindow;
+  let sourceRuntimeWindow: LensWindow;
+
+  if (sourceLens) {
+    const isCurrentLens = sourceLens.key === getLensIdForWindow(currentWindow);
+    const sourceWindow = isCurrentLens ? currentWindow : null;
+    if (isCurrentLens && sourceWindow) {
+      await syncRuntimeWindowFrameFromHost(sourceWindow.id);
+    }
+    sourceColabWindow = isCurrentLens
+      ? getCurrentColabWindow()
+      : parseStoredColabWindow(sourceLens);
+    sourceRuntimeWindow = sourceWindow
+      ? sourceWindow
+      : buildRuntimeWindowFromLens(
+          sourceLens,
+          sourceLens.windows[0]?.id || "main",
+        );
+  } else if (useCurrentWindowState) {
+    await syncRuntimeWindowFrameFromHost(currentWindow.id);
+    sourceColabWindow = getCurrentColabWindow();
+    sourceRuntimeWindow = currentWindow;
+  } else {
+    const workspaceCurrentLens = ensureWorkspaceCurrentLens(workspace.key);
+    sourceColabWindow = parseStoredColabWindow(workspaceCurrentLens);
+    sourceRuntimeWindow = buildRuntimeWindowFromLens(
+      workspaceCurrentLens,
+      workspaceCurrentLens.windows[0]?.id || "main",
+    );
+  }
+
+  const created = ensureDb().collection("layouts").insert({
+    key,
+    name: cleanName,
+    description: description.trim() || (sourceLens ? `Forked from ${sourceLens.name}` : `Saved from ${workspace.name}`),
+    workspaceId: workspace.key,
+    windowStateJson: serializeColabWindow(sourceColabWindow),
+    sortOrder: lenses.length,
+    windows: [toLensTemplateWindow(sourceRuntimeWindow)],
+  });
+
+  if (useCurrentWindowState) {
+    state.currentLayoutId = created.key;
+    currentWindow.lensId = created.key;
+    state.activeTreeNodeId = `lens-overview:${created.key}`;
+  }
+
+  flushDb();
+  await saveState();
+  syncTray();
+  if (useCurrentWindowState) {
+    emitSetProjectsForWindow(currentWindow.id);
+  } else {
+    emitSetProjects();
+  }
+  broadcastRuntimeEventToDashWindows("refreshBunnyDashState");
+  emitSnapshot();
+  log(sourceLens ? `lens forked: ${created.name}` : `lens created: ${created.name}`);
+  return snapshot();
+}
+
 async function createWorkspace(name: string, subtitle = "") {
   const db = ensureDb();
   const workspaces = listWorkspaces();
@@ -2702,6 +3062,7 @@ async function createWorkspace(name: string, subtitle = "") {
   const starterRuntimeWindow = buildRuntimeWindowFromLens(currentLens, getCurrentWindow().id);
 
   const currentWindow = getCurrentWindow();
+  await killTerminalsForWindow(currentWindow.id);
   currentWindow.workspaceId = created.key;
   currentWindow.title = starterRuntimeWindow.title;
   currentWindow.mainTabIds = [...starterRuntimeWindow.mainTabIds];
@@ -2786,40 +3147,39 @@ async function addProjectMount(params: {
 }
 
 async function saveLens(name: string, description = "") {
-  const lenses = listLenses();
   const workspace = getCurrentWorkspace();
   await syncRuntimeWindowFrameFromHost(getCurrentWindow().id);
   const currentColabWindow = getCurrentColabWindow();
   log(
     `saveLens begin: workspace=${workspace.key} name=${name || "<auto>"} rootPane=${currentColabWindow.rootPane.type} currentPane=${currentColabWindow.currentPaneId}`,
   );
-  const cleanName =
-    name.trim() ||
-    uniqueKey(`${workspace.name} Lens`, getLensesForWorkspace(workspace.key).map((lens) => lens.name))
-      .replace(/-/g, " ")
-      .replace(/\b\w/g, (match) => match.toUpperCase());
+  return createLens(
+    workspace.key,
+    name || getUniqueLensNameForWorkspace(workspace.key, "Lens"),
+    description,
+  );
+}
 
-  const key = uniqueKey(cleanName, lenses.map((lens) => lens.key));
-  const currentWindow = getCurrentWindow();
-  const created = ensureDb().collection("layouts").insert({
-    key,
+async function renameLens(lensId: string, name: string, description = "") {
+  const lens = getLensByKey(lensId);
+  if (isWorkspaceCurrentLensKey(lens.key)) {
+    throw new Error("Cannot rename the workspace current lens");
+  }
+
+  const workspace = getWorkspaceByKey(getLensWorkspaceId(lens));
+  const cleanName = getUniqueLensDisplayName(workspace.key, name, lens.key);
+  ensureDb().collection("layouts").update(lens.id, {
     name: cleanName,
-    description: description.trim() || `Saved from ${getCurrentWorkspace().name}`,
-    workspaceId: currentWindow.workspaceId,
-    windowStateJson: serializeColabWindow(currentColabWindow),
-    sortOrder: lenses.length,
-    windows: [toLensTemplateWindow(currentWindow)],
+    description: description.trim(),
   });
 
-  state.currentLayoutId = created.key;
-  currentWindow.lensId = created.key;
-  state.activeTreeNodeId = `lens-overview:${created.key}`;
   flushDb();
   await saveState();
   syncTray();
-  emitSetProjectsForWindow(currentWindow.id);
+  emitSetProjects();
+  broadcastRuntimeEventToDashWindows("refreshBunnyDashState");
   emitSnapshot();
-  log(`lens saved: ${created.name}`);
+  log(`lens renamed: ${cleanName}`);
   return snapshot();
 }
 
@@ -2870,6 +3230,7 @@ async function deleteLens(lensId: string) {
   const affectedWindows = runtimeWindows.filter((window) => getLensIdForWindow(window) === lens.key);
 
   for (const runtimeWindow of affectedWindows) {
+    await killTerminalsForWindow(runtimeWindow.id);
     const restoredWindow = buildRuntimeWindowFromLens(replacementLens, runtimeWindow.id);
     runtimeWindow.title = restoredWindow.title;
     runtimeWindow.lensId = restoredWindow.lensId;
@@ -2907,6 +3268,7 @@ async function deleteLens(lensId: string) {
   await saveState();
   syncTray();
   emitSetProjects();
+  broadcastRuntimeEventToDashWindows("refreshBunnyDashState");
   emitSnapshot();
   log(`lens deleted: ${lens.name}`);
   return snapshot();
@@ -3103,116 +3465,6 @@ function readSlateConfig(path: string) {
   } catch {
     return null;
   }
-}
-
-async function findFilesInWorkspace(query: string) {
-  const needle = query.trim().toLowerCase();
-  if (!needle) {
-    return [];
-  }
-
-  const matches: string[] = [];
-  const queue = getProjectMountsForWorkspace(getCurrentWorkspace().key).map((project) => project.path);
-
-  while (queue.length > 0 && matches.length < 200) {
-    const current = queue.shift()!;
-    let entries: string[] = [];
-    try {
-      entries = readdirSync(current);
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries) {
-      const fullPath = join(current, entry);
-      if (isIgnoredPath(fullPath)) {
-        continue;
-      }
-      let stat;
-      try {
-        stat = statSync(fullPath);
-      } catch {
-        continue;
-      }
-      if (stat.isDirectory()) {
-        queue.push(fullPath);
-      }
-      if (entry.toLowerCase().includes(needle)) {
-        matches.push(fullPath);
-      }
-      if (matches.length >= 200) {
-        break;
-      }
-    }
-  }
-
-  return matches;
-}
-
-async function findAllInWorkspace(query: string) {
-  const needle = query.trim();
-  if (!needle) {
-    return [];
-  }
-
-  const results: Array<{ path: string; line: number; column: number; match: string }> = [];
-  const queue = getProjectMountsForWorkspace(getCurrentWorkspace().key).map((project) => project.path);
-
-  while (queue.length > 0 && results.length < 200) {
-    const current = queue.shift()!;
-    let entries: string[] = [];
-    try {
-      entries = readdirSync(current);
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries) {
-      const fullPath = join(current, entry);
-      if (isIgnoredPath(fullPath)) {
-        continue;
-      }
-      let stat;
-      try {
-        stat = statSync(fullPath);
-      } catch {
-        continue;
-      }
-      if (stat.isDirectory()) {
-        queue.push(fullPath);
-        continue;
-      }
-
-      let contents = "";
-      try {
-        contents = readFileSync(fullPath, "utf8");
-      } catch {
-        continue;
-      }
-
-      const lines = contents.split("\n");
-      for (let index = 0; index < lines.length; index += 1) {
-        const column = lines[index]!.indexOf(needle);
-        if (column >= 0) {
-          results.push({
-            path: fullPath,
-            line: index + 1,
-            column: column + 1,
-            match: lines[index]!,
-          });
-        }
-        if (results.length >= 200) {
-          break;
-        }
-      }
-
-      if (results.length >= 200) {
-        break;
-      }
-    }
-  }
-
-  return results;
 }
 
 function buildWorkspaceLensSidebarData() {
@@ -3431,42 +3683,89 @@ async function handleColabRequest(method: string, params: any) {
       return new TextDecoder().decode(result.stdout || new Uint8Array());
     }
     case "createTerminal":
-      return (() => {
-        const terminalId = getTerminalManager().createTerminal(
-        String(params?.cwd || process.cwd()),
-        typeof params?.shell === "string" ? params.shell : undefined,
+      return (async () => {
+        const currentWindowId = getCurrentWindow().id;
+        const terminalId = await invokePtyCarrot<string>(
+          "createTerminal",
+          {
+            cwd: String(params?.cwd || process.cwd()),
+            shell: typeof params?.shell === "string" ? params.shell : undefined,
+            cols: Number(params?.cols || 80),
+            rows: Number(params?.rows || 24),
+          },
+          { windowId: currentWindowId },
         );
-        terminalWindowOwners.set(terminalId, getCurrentWindow().id);
+        log(`PTY carrot created terminal ${terminalId} for window ${currentWindowId}`);
+        terminalWindowOwners.set(terminalId, currentWindowId);
         return terminalId;
       })();
     case "writeToTerminal":
-      return getTerminalManager().writeToTerminal(
-        String(params?.terminalId || ""),
-        String(params?.data || ""),
-      );
+      return invokePtyCarrot<boolean>("writeToTerminal", {
+        terminalId: String(params?.terminalId || ""),
+        data: String(params?.data || ""),
+      });
     case "resizeTerminal":
-      return getTerminalManager().resizeTerminal(
-        String(params?.terminalId || ""),
-        Number(params?.cols || 80),
-        Number(params?.rows || 24),
-      );
+      return invokePtyCarrot<boolean>("resizeTerminal", {
+        terminalId: String(params?.terminalId || ""),
+        cols: Number(params?.cols || 80),
+        rows: Number(params?.rows || 24),
+      });
     case "killTerminal":
-      return getTerminalManager().killTerminal(String(params?.terminalId || ""));
+      return (async () => {
+        const result = await invokePtyCarrot<boolean>("killTerminal", {
+          terminalId: String(params?.terminalId || ""),
+        });
+        terminalWindowOwners.delete(String(params?.terminalId || ""));
+        return result;
+      })();
     case "getTerminalCwd":
-      return getTerminalManager().getTerminalCwd(String(params?.terminalId || ""));
+      return invokePtyCarrot<string | null>("getTerminalCwd", {
+        terminalId: String(params?.terminalId || ""),
+      });
     case "getWorkspaceLensSidebar":
       return buildWorkspaceLensSidebarData();
     case "activateLens":
       return activateLens(String(params?.lensId || state.currentLayoutId));
     case "findFilesInWorkspace":
-      return findFilesInWorkspace(String(params?.query || ""));
+      return invokeSearchCarrot<string[]>(
+        "findFilesInWorkspace",
+        {
+          query: String(params?.query || ""),
+          targets: buildSearchTargetsForWorkspace(),
+        },
+        { windowId: getCurrentWindow().id },
+      );
     case "findAllInWorkspace":
-      return findAllInWorkspace(String(params?.query || ""));
+      return invokeSearchCarrot<
+        Array<{ path: string; line: number; column: number; match: string }>
+      >(
+        "findAllInWorkspace",
+        {
+          query: String(params?.query || ""),
+          targets: buildSearchTargetsForWorkspace(),
+        },
+        { windowId: getCurrentWindow().id },
+      );
     case "cancelFileSearch":
+      return invokeSearchCarrot<boolean>("cancelFileSearch", {}, {
+        windowId: getCurrentWindow().id,
+      });
     case "cancelFindAll":
-      return true;
+      return invokeSearchCarrot<boolean>("cancelFindAll", {}, {
+        windowId: getCurrentWindow().id,
+      });
+    case "findFirstNestedGitRepo":
+      return invokeSearchCarrot<string | null>("findFirstNestedGitRepo", {
+        searchPath: String(params?.searchPath || ""),
+        timeoutMs: Number(params?.timeoutMs || 5_000),
+      });
     case "getUniqueNewName":
       return getUniqueNewName(String(params?.parentPath || ""), String(params?.baseName || "untitled"));
+    case "getUniqueLensName":
+      return getUniqueLensNameForWorkspace(
+        String(params?.workspaceId || getCurrentWorkspace().key),
+        String(params?.baseName || "Lens"),
+      );
     case "makeFileNameSafe":
       return makeFileNameSafe(String(params?.value || ""));
     case "getFaviconForUrl":
@@ -3658,10 +3957,6 @@ async function handleColabSend(name: string, payload: any) {
   }
 }
 
-process.on("exit", () => {
-  terminalManager?.cleanup();
-});
-
 self.onmessage = async (event) => {
   const message = event.data as any;
 
@@ -3673,6 +3968,16 @@ self.onmessage = async (event) => {
 
   if (message.type === "event") {
     await ensureBootPromise();
+
+    if (message.name === "search-find-all-results") {
+      handleSearchFindAllResults(message.payload);
+      return;
+    }
+
+    if (message.name === "search-find-files-results") {
+      handleSearchFindFilesResults(message.payload);
+      return;
+    }
 
     if (message.name === "boot") {
       syncTray();
@@ -3690,13 +3995,9 @@ self.onmessage = async (event) => {
     if (message.name === "window-closed") {
       const closedWindowId = String(message.payload?.windowId || "");
       browserWindows.delete(closedWindowId);
+      await killTerminalsForWindow(closedWindowId);
       removeColabWindowFromAllWorkspaces(closedWindowId);
       runtimeWindows = runtimeWindows.filter((window) => window.id !== closedWindowId);
-      terminalWindowOwners.forEach((ownerWindowId, terminalId) => {
-        if (ownerWindowId === closedWindowId) {
-          terminalWindowOwners.delete(terminalId);
-        }
-      });
       const pendingPersist = framePersistTimers.get(closedWindowId);
       if (pendingPersist) {
         clearTimeout(pendingPersist);
@@ -3858,6 +4159,25 @@ self.onmessage = async (event) => {
           String(message.params?.description || ""),
         );
         post({ type: "response", requestId: message.requestId, success: true, payload: created });
+        break;
+      }
+      case "createLens": {
+        const created = await createLens(
+          String(message.params?.workspaceId || getCurrentWorkspace().key),
+          String(message.params?.name || ""),
+          String(message.params?.description || ""),
+          typeof message.params?.sourceLensId === "string" ? message.params.sourceLensId : undefined,
+        );
+        post({ type: "response", requestId: message.requestId, success: true, payload: created });
+        break;
+      }
+      case "renameLens": {
+        const renamed = await renameLens(
+          String(message.params?.lensId || state.currentLayoutId),
+          String(message.params?.name || ""),
+          String(message.params?.description || ""),
+        );
+        post({ type: "response", requestId: message.requestId, success: true, payload: renamed });
         break;
       }
       default: {
