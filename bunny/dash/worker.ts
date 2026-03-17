@@ -139,6 +139,10 @@ type ProjectMountDoc = DashDocumentTypes["projectMounts"];
 type LensDoc = DashDocumentTypes["layouts"];
 type CurrentStateDoc = DashDocumentTypes["sessionSnapshots"];
 type UiSettingsDoc = DashDocumentTypes["uiSettings"];
+type TypeScriptPeerDependencyStatus = {
+  installed: boolean;
+  version: string;
+};
 
 type Snapshot = {
   shellTitle: string;
@@ -235,8 +239,14 @@ const LIVE_WINDOW_ID_SEPARATOR = "::";
 const WORKSPACE_CURRENT_LENS_PREFIX = "__workspace-current__:";
 const PTY_CARROT_ID = "bunny.pty";
 const SEARCH_CARROT_ID = "bunny.search";
+const GIT_CARROT_ID = "bunny.git";
+const TSSERVER_CARROT_ID = "bunny.tsserver";
 const DEFAULT_PTY_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 let ptyHeartbeatIntervalMs = DEFAULT_PTY_HEARTBEAT_INTERVAL_MS;
+let typeScriptPeerDependencyStatus: TypeScriptPeerDependencyStatus = {
+  installed: false,
+  version: "",
+};
 const LEGACY_CURRENT_SESSION_MAIN_TABS: WindowTabId[] = [
   "workspace",
   "projects",
@@ -726,6 +736,17 @@ async function handleContextMenuAction(action: string, data: any) {
         nodeType: "repo",
       });
       return;
+    case "init_git_in_folder": {
+      const nodePath = String(data?.nodePath || "");
+      if (!nodePath) {
+        return;
+      }
+      await invokeGitCarrot("initGit", { repoRoot: nodePath }, { windowId });
+      emitFileWatchEvent(join(nodePath, ".git"));
+      emitFileWatchEvent(join(nodePath, ".gitignore"));
+      emitFileWatchEvent(nodePath);
+      return;
+    }
     case "copy_path_to_clipboard":
       await Utils.clipboardWriteText(String(data?.nodePath || ""));
       return;
@@ -1051,6 +1072,7 @@ function ensureBootPromise() {
       ensureRuntimeState();
       currentState = captureCurrentState();
       ensurePtyHeartbeatLoop();
+      await refreshTypeScriptPeerDependencyStatus();
       syncApplicationMenu();
       await reopenRuntimeWindowsOnBoot();
       post({ type: "ready" });
@@ -1436,8 +1458,8 @@ function colabPeerDependencies() {
       version: Bun.version,
     },
     typescript: {
-      installed: false,
-      version: "",
+      installed: typeScriptPeerDependencyStatus.installed,
+      version: typeScriptPeerDependencyStatus.version,
     },
     biome: {
       installed: false,
@@ -1578,6 +1600,82 @@ async function invokeSearchCarrot<T = unknown>(
   return Carrots.invoke<T>(SEARCH_CARROT_ID, method, params, options);
 }
 
+async function invokeGitCarrot<T = unknown>(
+  method: string,
+  params?: unknown,
+  options?: { windowId?: string },
+) {
+  return Carrots.invoke<T>(GIT_CARROT_ID, method, params, options);
+}
+
+async function invokeTsServerCarrot<T = unknown>(
+  method: string,
+  params?: unknown,
+  options?: { windowId?: string },
+) {
+  return Carrots.invoke<T>(TSSERVER_CARROT_ID, method, params, options);
+}
+
+async function refreshTypeScriptPeerDependencyStatus() {
+  try {
+    const status = await invokeTsServerCarrot<TypeScriptPeerDependencyStatus>("getTypeScriptStatus");
+    typeScriptPeerDependencyStatus = {
+      installed: Boolean(status?.installed),
+      version: String(status?.version || ""),
+    };
+  } catch {
+    typeScriptPeerDependencyStatus = {
+      installed: false,
+      version: "",
+    };
+  }
+}
+
+async function closeTsServerEditor(metadata: {
+  workspaceId?: string;
+  windowId?: string;
+  editorId?: string;
+}) {
+  if (!metadata.workspaceId || !metadata.windowId || !metadata.editorId) {
+    return;
+  }
+
+  try {
+    await invokeTsServerCarrot(
+      "closeEditor",
+      {
+        metadata: {
+          workspaceId: metadata.workspaceId,
+          windowId: metadata.windowId,
+          editorId: metadata.editorId,
+        },
+      },
+      { windowId: metadata.windowId },
+    );
+  } catch {
+    // Ignore editor-level tsserver cleanup failures. Window-level cleanup is the backstop.
+  }
+}
+
+async function closeTsServerEditorsForWindow(windowId: string, workspaceId?: string) {
+  if (!windowId) {
+    return;
+  }
+
+  try {
+    await invokeTsServerCarrot(
+      "closeWindowEditors",
+      {
+        windowId,
+        workspaceId,
+      },
+      { windowId },
+    );
+  } catch {
+    // Ignore window-level cleanup failures here. Reopen paths will re-establish state.
+  }
+}
+
 function buildSearchTargetsForWorkspace(workspaceId = getCurrentWorkspace().key) {
   return getProjectMountsForWorkspace(workspaceId).map((project) => ({
     projectId: project.key,
@@ -1665,6 +1763,40 @@ function handleSearchFindFilesResults(payload: unknown) {
       results: Array.isArray(eventPayload.results) ? eventPayload.results.map(String) : [],
     },
   );
+}
+
+function handleTsServerMessage(payload: unknown) {
+  const eventPayload =
+    payload && typeof payload === "object"
+      ? (payload as {
+          message?: Record<string, unknown>;
+          metadata?: {
+            workspaceId?: string;
+            windowId?: string;
+            editorId?: string;
+          };
+          windowId?: string | null;
+        })
+      : {};
+
+  const targetWindowId =
+    typeof eventPayload.metadata?.windowId === "string"
+      ? eventPayload.metadata.windowId
+      : typeof eventPayload.windowId === "string"
+        ? eventPayload.windowId
+        : state.currentWindowId;
+
+  sendRuntimeEventToDashWindow(targetWindowId, "tsServerMessage", {
+    message:
+      eventPayload.message && typeof eventPayload.message === "object"
+        ? eventPayload.message
+        : {},
+    metadata: {
+      workspaceId: String(eventPayload.metadata?.workspaceId || ""),
+      windowId: String(targetWindowId || ""),
+      editorId: String(eventPayload.metadata?.editorId || ""),
+    },
+  });
 }
 
 app.on("pty-terminal-output", handlePtyTerminalOutput);
@@ -2831,6 +2963,7 @@ async function restoreLensInCurrentWindow(lensId: string) {
     `restoreLensInCurrentWindow begin: ${lens.key} rootPane=${savedWindowState.rootPane.type} currentPane=${savedWindowState.currentPaneId}`,
   );
   const currentWindow = getCurrentWindow();
+  await closeTsServerEditorsForWindow(currentWindow.id, currentWindow.workspaceId);
   await killTerminalsForWindow(currentWindow.id);
   const restoredWindow = buildRuntimeWindowFromLens(lens, currentWindow.id);
 
@@ -2925,6 +3058,9 @@ async function openLens(lensId: string) {
 }
 
 async function restoreCurrentState() {
+  for (const runtimeWindow of runtimeWindows) {
+    await closeTsServerEditorsForWindow(runtimeWindow.id, runtimeWindow.workspaceId);
+  }
   const snapshotDoc = getCurrentStateDoc();
   runtimeWindows = cloneWindows(snapshotDoc.windows);
   state.currentLayoutId = snapshotDoc.currentLayoutId;
@@ -3062,6 +3198,7 @@ async function createWorkspace(name: string, subtitle = "") {
   const starterRuntimeWindow = buildRuntimeWindowFromLens(currentLens, getCurrentWindow().id);
 
   const currentWindow = getCurrentWindow();
+  await closeTsServerEditorsForWindow(currentWindow.id, currentWindow.workspaceId);
   await killTerminalsForWindow(currentWindow.id);
   currentWindow.workspaceId = created.key;
   currentWindow.title = starterRuntimeWindow.title;
@@ -3230,6 +3367,7 @@ async function deleteLens(lensId: string) {
   const affectedWindows = runtimeWindows.filter((window) => getLensIdForWindow(window) === lens.key);
 
   for (const runtimeWindow of affectedWindows) {
+    await closeTsServerEditorsForWindow(runtimeWindow.id, runtimeWindow.workspaceId);
     await killTerminalsForWindow(runtimeWindow.id);
     const restoredWindow = buildRuntimeWindowFromLens(replacementLens, runtimeWindow.id);
     runtimeWindow.title = restoredWindow.title;
@@ -3754,6 +3892,52 @@ async function handleColabRequest(method: string, params: any) {
       return invokeSearchCarrot<boolean>("cancelFindAll", {}, {
         windowId: getCurrentWindow().id,
       });
+    case "gitShow":
+    case "gitCommit":
+    case "gitCommitAmend":
+    case "gitAdd":
+    case "gitLog":
+    case "gitStatus":
+    case "gitDiff":
+    case "gitCheckout":
+    case "gitCheckIsRepoRoot":
+    case "gitCheckIsRepoInTree":
+    case "gitRevParse":
+    case "gitReset":
+    case "gitRevert":
+    case "gitApply":
+    case "gitStageHunkFromPatch":
+    case "gitStageSpecificLines":
+    case "gitStageMonacoChange":
+    case "gitUnstageMonacoChange":
+    case "gitCreatePatchFromLines":
+    case "gitStashList":
+    case "gitStashCreate":
+    case "gitStashApply":
+    case "gitStashPop":
+    case "gitStashShow":
+    case "gitRemote":
+    case "gitAddRemote":
+    case "gitFetch":
+    case "gitPull":
+    case "gitPush":
+    case "gitBranch":
+    case "gitCheckoutBranch":
+    case "gitLogRemoteOnly":
+    case "gitClone":
+    case "gitValidateUrl":
+    case "getGitConfig":
+    case "setGitConfig":
+    case "checkGitHubCredentials":
+    case "storeGitHubCredentials":
+    case "removeGitHubCredentials":
+    case "gitCreateBranch":
+    case "gitDeleteBranch":
+    case "gitTrackRemoteBranch":
+    case "initGit":
+      return invokeGitCarrot(method, params, {
+        windowId: getCurrentWindow().id,
+      });
     case "findFirstNestedGitRepo":
       return invokeSearchCarrot<string | null>("findFirstNestedGitRepo", {
         searchPath: String(params?.searchPath || ""),
@@ -3815,14 +3999,6 @@ async function handleColabRequest(method: string, params: any) {
     case "getTokens":
       return colabState.tokens || [];
     case "setToken":
-      return;
-    case "getGitConfig":
-      return { name: "", email: "", hasKeychainHelper: false };
-    case "checkGitHubCredentials":
-      return { hasCredentials: false };
-    case "storeGitHubCredentials":
-    case "removeGitHubCredentials":
-    case "setGitConfig":
       return;
     default:
       return UNHANDLED_COLAB_REQUEST;
@@ -3939,8 +4115,33 @@ async function handleColabSend(name: string, payload: any) {
     case "addToken":
     case "deleteToken":
     case "formatFile":
-    case "tsServerRequest":
     case "syncDevlink":
+      return;
+    case "tsServerRequest":
+      await invokeTsServerCarrot<boolean>(
+        "tsServerRequest",
+        {
+          command: String(payload?.command || ""),
+          args: payload?.args ?? {},
+          metadata:
+            payload && typeof payload === "object" && payload.metadata && typeof payload.metadata === "object"
+              ? payload.metadata
+              : {},
+        },
+        {
+          windowId:
+            payload && typeof payload === "object" && typeof payload?.metadata?.windowId === "string"
+              ? payload.metadata.windowId
+              : getCurrentWindow().id,
+        },
+      );
+      return;
+    case "tsServerEditorClosed":
+      await closeTsServerEditor(
+        payload && typeof payload === "object" && payload.metadata && typeof payload.metadata === "object"
+          ? payload.metadata
+          : {},
+      );
       return;
     case "createWindow":
       await createAdditionalWindow(
@@ -3979,6 +4180,11 @@ self.onmessage = async (event) => {
       return;
     }
 
+    if (message.name === "tsserver-message") {
+      handleTsServerMessage(message.payload);
+      return;
+    }
+
     if (message.name === "boot") {
       syncTray();
       emitSnapshot();
@@ -3994,7 +4200,9 @@ self.onmessage = async (event) => {
 
     if (message.name === "window-closed") {
       const closedWindowId = String(message.payload?.windowId || "");
+      const closedRuntimeWindow = runtimeWindows.find((window) => window.id === closedWindowId);
       browserWindows.delete(closedWindowId);
+      await closeTsServerEditorsForWindow(closedWindowId, closedRuntimeWindow?.workspaceId);
       await killTerminalsForWindow(closedWindowId);
       removeColabWindowFromAllWorkspaces(closedWindowId);
       runtimeWindows = runtimeWindows.filter((window) => window.id !== closedWindowId);
