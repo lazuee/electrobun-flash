@@ -137,6 +137,30 @@ function getPlatformPaths(
 	};
 }
 
+function getCefMajorVersion(cefVersionString: string): number | null {
+	const match = cefVersionString.match(/^(\d+)/);
+	if (!match) return null;
+	const majorStr = match[1];
+	if (!majorStr) return null;
+	const major = Number.parseInt(majorStr, 10);
+	return Number.isFinite(major) ? major : null;
+}
+
+function getCefDownloadArch(
+	targetArch: "arm64" | "x64",
+	cefVersion?: string,
+): "arm64" | "x64" {
+	const version = cefVersion || DEFAULT_CEF_VERSION_STRING;
+	const major = getCefMajorVersion(version);
+	if (targetArch === "arm64" && major !== null && major <= 87) {
+		console.log(
+			`CEF ${version} does not support arm64; forcing x64 vendor/download artifacts`,
+		);
+		return "x64";
+	}
+	return targetArch;
+}
+
 // Default PATHS for host platform (backward compatibility)
 // @ts-expect-error - reserved for future use
 const _PATHS = getPlatformPaths(OS, ARCH);
@@ -795,6 +819,7 @@ async function ensureCEFDependencies(
 	// Use provided target platform or default to host platform
 	const platformOS = targetOS || OS;
 	const platformArch = targetArch || ARCH;
+	const cefDownloadArch = getCefDownloadArch(platformArch, cefVersion);
 
 	// Get platform-specific paths
 	const platformPaths = getPlatformPaths(platformOS, platformArch);
@@ -847,7 +872,7 @@ async function ensureCEFDependencies(
 
 	const platformName =
 		platformOS === "macos" ? "darwin" : platformOS === "win" ? "win" : "linux";
-	const archName = platformArch;
+	const archName = cefDownloadArch;
 	const cefTarballUrl = `https://github.com/blackboardsh/electrobun/releases/download/${version}/electrobun-cef-${platformName}-${archName}.tar.gz`;
 
 	// Helper function to download with retry logic
@@ -1283,6 +1308,8 @@ async function downloadAndExtractCustomCEF(
 	const cefVer = match[1]!;
 	const chromiumVer = match[2]!;
 
+	const cefDownloadArch = getCefDownloadArch(platformArch, cefVersion);
+
 	// Map platform names to Spotify CDN naming
 	const cefPlatformMap: Record<string, string> = {
 		"macos-arm64": "macosarm64",
@@ -1292,10 +1319,10 @@ async function downloadAndExtractCustomCEF(
 		"linux-x64": "linux64",
 		"linux-arm64": "linuxarm64",
 	};
-	const cefPlatform = cefPlatformMap[`${platformOS}-${platformArch}`];
+	const cefPlatform = cefPlatformMap[`${platformOS}-${cefDownloadArch}`];
 	if (!cefPlatform) {
 		throw new Error(
-			`Unsupported platform/arch for custom CEF: ${platformOS}-${platformArch}`,
+			`Unsupported platform/arch for custom CEF: ${platformOS}-${cefDownloadArch}`,
 		);
 	}
 

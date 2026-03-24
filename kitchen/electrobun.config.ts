@@ -1,5 +1,9 @@
 import type { ElectrobunConfig } from "electrobun";
 
+export const CEF_VERSION = `87.1.14+ga29e9a3`;
+export const CHROMIUM_VERSION = `87.0.4280.141`;
+export const CUSTOM_CEF_VERSION_STRING = `${CEF_VERSION}+chromium-${CHROMIUM_VERSION}`;
+
 export default {
 	app: {
 		name: "Electrobun Kitchen Sink",
@@ -12,7 +16,7 @@ export default {
 	},
 	build: {
 		useAsar: true,
-		// cefVersion: "144.0.12+g1a1008c+chromium-144.0.7559.110",
+		cefVersion: CUSTOM_CEF_VERSION_STRING,
 		// bunVersion: "1.3.7",
 		bun: {
 			entrypoint: "src/bun/index.ts",

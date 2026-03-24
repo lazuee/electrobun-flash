@@ -346,7 +346,12 @@ extern "C" __declspec(dllexport) void asar_close(void* archive) {
 #include "include/cef_command_line.h"
 #include "include/cef_scheme.h"
 #include "include/cef_context_menu_handler.h"
+#include "include/cef_version.h"
+#if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR <= 87)
+#include "include/cef_request_context_handler.h"
+#else
 #include "include/cef_permission_handler.h"
+#endif
 #include "include/cef_dialog_handler.h"
 #include "include/cef_download_handler.h"
 #include "include/cef_task.h"
@@ -521,6 +526,11 @@ static int FindAvailableRemoteDebugPort(int startPort, int endPort) {
 // CEF global variables
 static bool g_cef_initialized = false;
 static CefRefPtr<CefApp> g_cef_app;
+#ifdef CEF_VERSION_MAJOR
+static bool CEF_BELOW_V87 = (CEF_VERSION_MAJOR <= 87);
+#else
+static bool CEF_BELOW_V87 = false;
+#endif
 static electrobun::ChromiumFlagConfig g_userChromiumFlags;
 static HANDLE g_job_object = nullptr;  // Job object to track all child processes
 
@@ -1096,6 +1106,7 @@ private:
 };
 
 // CEF Permission Handler for user media and other permissions
+#if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
 class ElectrobunPermissionHandler : public CefPermissionHandler {
 public:
     bool OnRequestMediaAccessPermission(
@@ -1230,6 +1241,7 @@ public:
 private:
     IMPLEMENT_REFCOUNTING(ElectrobunPermissionHandler);
 };
+#endif
 
 // Helper functions for string conversion
 std::wstring StringToWString(const std::string& str) {
@@ -1432,10 +1444,17 @@ class ElectrobunDownloadHandler : public CefDownloadHandler {
 public:
     ElectrobunDownloadHandler() {}
 
+    #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR <= 87)
+    void OnBeforeDownload(CefRefPtr<CefBrowser> browser,
+                          CefRefPtr<CefDownloadItem> download_item,
+                          const CefString& suggested_name,
+                          CefRefPtr<CefBeforeDownloadCallback> callback) override {
+    #else
     bool OnBeforeDownload(CefRefPtr<CefBrowser> browser,
                           CefRefPtr<CefDownloadItem> download_item,
                           const CefString& suggested_name,
                           CefRefPtr<CefBeforeDownloadCallback> callback) override {
+    #endif
         printf("CEF Windows: OnBeforeDownload for %s\n", suggested_name.ToString().c_str());
 
         // Get the Downloads folder using Windows API
@@ -1484,7 +1503,9 @@ public:
             callback->Continue("", false);
         }
 
-        return true;  // We handled it
+        #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+            return true;  // We handled it
+        #endif
     }
 
     void OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
@@ -1777,7 +1798,9 @@ public:
         m_requestHandler->SetWebviewId(webviewId);
         m_requestHandler->SetClient(this); // Set client reference for response filter
         m_contextMenuHandler = new ElectrobunContextMenuHandler();
-        m_permissionHandler = new ElectrobunPermissionHandler();
+        #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+            m_permissionHandler = new ElectrobunPermissionHandler();
+        #endif
         m_dialogHandler = new ElectrobunDialogHandler();
         m_downloadHandler = new ElectrobunDownloadHandler();
         m_keyboardHandler = new ElectrobunKeyboardHandler();
@@ -1846,11 +1869,13 @@ public:
     CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override {
         return m_contextMenuHandler;
     }
-    
-    CefRefPtr<CefPermissionHandler> GetPermissionHandler() override {
-        return m_permissionHandler;
-    }
-    
+
+    #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+        CefRefPtr<CefPermissionHandler> GetPermissionHandler() override {
+            return m_permissionHandler;
+        }
+    #endif
+
     CefRefPtr<CefDialogHandler> GetDialogHandler() override {
         return m_dialogHandler;
     }
@@ -2143,7 +2168,9 @@ public:
         CefRect cefRect(0, 0, rect.right - rect.left, rect.bottom - rect.top);
 
         CefWindowInfo windowInfo;
-        windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+        #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+            windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+        #endif
         windowInfo.SetAsChild((CefWindowHandle)host.window, cefRect);
 
         CefBrowserSettings settings;
@@ -2202,7 +2229,9 @@ private:
     CefRefPtr<ElectrobunLifeSpanHandler> m_lifeSpanHandler;
     CefRefPtr<ElectrobunRequestHandler> m_requestHandler;
     CefRefPtr<ElectrobunContextMenuHandler> m_contextMenuHandler;
-    CefRefPtr<ElectrobunPermissionHandler> m_permissionHandler;
+    #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+        CefRefPtr<ElectrobunPermissionHandler> m_permissionHandler;
+    #endif
     CefRefPtr<ElectrobunDialogHandler> m_dialogHandler;
     CefRefPtr<ElectrobunDownloadHandler> m_downloadHandler;
     CefRefPtr<ElectrobunKeyboardHandler> m_keyboardHandler;
@@ -6743,7 +6772,9 @@ static std::shared_ptr<CEFView> createCEFView(uint32_t webviewId,
         
         // Create CEF browser info
         CefWindowInfo windowInfo;
-        windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+        #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+            windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+        #endif
         CefRect cefBounds((int)x, (int)y, (int)width, (int)height);
 
         CefBrowserSettings browserSettings;

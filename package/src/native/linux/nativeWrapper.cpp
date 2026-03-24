@@ -105,7 +105,12 @@ using electrobun::OperationGuard;
 #include "include/cef_context_menu_handler.h"
 #include "include/cef_keyboard_handler.h"
 #include "include/cef_response_filter.h"
+#include "include/cef_version.h"
+#if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR <= 87)
+#include "include/cef_request_context_handler.h"
+#else
 #include "include/cef_permission_handler.h"
+#endif
 #include "include/cef_dialog_handler.h"
 #include "include/cef_download_handler.h"
 #include "include/wrapper/cef_helpers.h"
@@ -338,6 +343,11 @@ bool checkNavigationRules(std::shared_ptr<AbstractView> view, const std::string&
 static std::atomic<bool> g_cefInitialized{false};
 static std::atomic<bool> g_useCEF{false};
 static std::atomic<bool> g_checkedForCEF{false};
+#ifdef CEF_VERSION_MAJOR
+static bool CEF_BELOW_V87 = (CEF_VERSION_MAJOR <= 87);
+#else
+static bool CEF_BELOW_V87 = false;
+#endif
 
 // Global webview storage to keep shared_ptr alive
 static std::map<uint32_t, std::shared_ptr<AbstractView>> g_webviewMap;
@@ -852,7 +862,9 @@ class ElectrobunClient : public CefClient,
                         public CefKeyboardHandler,
                         public CefResourceRequestHandler,
                         public CefLifeSpanHandler,
+#if !defined(CEF_VERSION_MAJOR) || (CEF_VERSION_MAJOR > 87)
                         public CefPermissionHandler,
+#endif
                         public CefDialogHandler,
                         public CefDownloadHandler,
                         public CefRenderHandler {
@@ -999,11 +1011,13 @@ public:
     virtual CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override {
         return this;
     }
-    
+
+#if !defined(CEF_VERSION_MAJOR) || (CEF_VERSION_MAJOR > 87)
     virtual CefRefPtr<CefPermissionHandler> GetPermissionHandler() override {
         return this;
     }
-    
+#endif
+
     virtual CefRefPtr<CefDialogHandler> GetDialogHandler() override {
         return this;
     }
@@ -1196,7 +1210,9 @@ public:
                 printf("CEF: Opening DevTools...\n");
                 {
                     CefWindowInfo devToolsInfo;
+#if !defined(CEF_VERSION_MAJOR) || (CEF_VERSION_MAJOR > 87)
                     devToolsInfo.runtime_style = CEF_RUNTIME_STYLE_CHROME;
+#endif
                     browser->GetHost()->ShowDevTools(devToolsInfo, this, CefBrowserSettings(), CefPoint());
                 }
                 return true;
@@ -1225,7 +1241,9 @@ public:
             printf("CEF: F12 pressed - opening DevTools\n");
             {
                 CefWindowInfo devToolsInfo;
+#if !defined(CEF_VERSION_MAJOR) || (CEF_VERSION_MAJOR > 87)
                 devToolsInfo.runtime_style = CEF_RUNTIME_STYLE_CHROME;
+#endif
                 browser->GetHost()->ShowDevTools(devToolsInfo, this, CefBrowserSettings(), CefPoint());
             }
             return true; // Consume the event
@@ -1533,6 +1551,7 @@ public:
     }
     
     // Permission Handler methods for CEF
+#if !defined(CEF_VERSION_MAJOR) || (CEF_VERSION_MAJOR > 87)
     virtual bool OnRequestMediaAccessPermission(
         CefRefPtr<CefBrowser> browser,
         CefRefPtr<CefFrame> frame,
@@ -1700,6 +1719,7 @@ public:
         printf("CEF: Permission prompt dismissed with result %d\n", result);
         // Optional: Handle prompt dismissal if needed
     }
+#endif
     
     // CefDialogHandler methods
     virtual bool OnFileDialog(CefRefPtr<CefBrowser> browser,
@@ -1825,10 +1845,17 @@ public:
     }
 
     // CefDownloadHandler methods
+#if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR <= 87)
+    void OnBeforeDownload(CefRefPtr<CefBrowser> browser,
+                          CefRefPtr<CefDownloadItem> download_item,
+                          const CefString& suggested_name,
+                          CefRefPtr<CefBeforeDownloadCallback> callback) override {
+#else
     bool OnBeforeDownload(CefRefPtr<CefBrowser> browser,
                           CefRefPtr<CefDownloadItem> download_item,
                           const CefString& suggested_name,
                           CefRefPtr<CefBeforeDownloadCallback> callback) override {
+#endif
         printf("CEF Linux: OnBeforeDownload for %s\n", suggested_name.ToString().c_str());
 
         // Get the Downloads folder using GLib
@@ -1883,7 +1910,9 @@ public:
             callback->Continue("", false);
         }
 
+    #if !defined(CEF_VERSION_MAJOR) || (CEF_VERSION_MAJOR > 87)
         return true;  // We handled it
+    #endif
     }
 
     void OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
@@ -3739,7 +3768,9 @@ public:
         // Create CEF browser immediately as child of X11 window
         CefWindowInfo window_info;
         // Use Alloy runtime style for embedded windows (like macOS)
+    #if !defined(CEF_VERSION_MAJOR) || (CEF_VERSION_MAJOR > 87)
         window_info.runtime_style = CEF_RUNTIME_STYLE_CHROME;
+    #endif
         
         // For child windows, position should be relative to parent (0,0 for fullscreen)
         CefRect cef_rect((int)x, (int)y, (int)width, (int)height);
@@ -4437,7 +4468,9 @@ public:
         CefRefPtr<CefBrowserHost> host = browser->GetHost();
         if (host) {
             CefWindowInfo devToolsInfo;
+#if !defined(CEF_VERSION_MAJOR) || (CEF_VERSION_MAJOR > 87)
             devToolsInfo.runtime_style = CEF_RUNTIME_STYLE_CHROME;
+#endif
             host->ShowDevTools(devToolsInfo, nullptr, CefBrowserSettings(), CefPoint());
         }
     }
@@ -4460,7 +4493,9 @@ public:
                 host->CloseDevTools();
             } else {
                 CefWindowInfo devToolsInfo;
+#if !defined(CEF_VERSION_MAJOR) || (CEF_VERSION_MAJOR > 87)
                 devToolsInfo.runtime_style = CEF_RUNTIME_STYLE_CHROME;
+#endif
                 host->ShowDevTools(devToolsInfo, nullptr, CefBrowserSettings(), CefPoint());
             }
         }
