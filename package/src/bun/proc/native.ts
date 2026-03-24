@@ -1125,6 +1125,11 @@ export const ffi = {
 			const windowPtr = parentWindow?.ptr;
 			// Get transparent flag from parent window
 			const transparent = parentWindow?.transparent ?? false;
+			const secretKeyBytes = secretKey
+				.split(",")
+				.map((v) => Number.parseInt(v.trim(), 10))
+				.filter((n) => Number.isFinite(n) && n >= 0 && n <= 255);
+			const secretKeyBytesLiteral = JSON.stringify(secretKeyBytes);
 
 			if (!windowPtr) {
 				throw `Can't add webview to window. window no longer exists`;
@@ -1159,10 +1164,19 @@ window.__electrobunInternalBridge = window.__electrobunInternalBridge || window.
 window.__electrobunWebviewId = ${id};
 window.__electrobunWindowId = ${windowId};
 window.__electrobunRpcSocketPort = ${rpcPort};
-window.__electrobunSecretKeyBytes = [${secretKey}];
-window.__electrobunEventBridge = window.__electrobunEventBridge || window.webkit?.messageHandlers?.eventBridge || window.eventBridge || window.chrome?.webview?.hostObjects?.eventBridge;
-window.__electrobunInternalBridge = window.__electrobunInternalBridge || window.webkit?.messageHandlers?.internalBridge || window.internalBridge || window.chrome?.webview?.hostObjects?.internalBridge;
-window.__electrobunBunBridge = window.__electrobunBunBridge || window.webkit?.messageHandlers?.bunBridge || window.bunBridge || window.chrome?.webview?.hostObjects?.bunBridge;
+window.__electrobunSecretKeyBytes = ${secretKeyBytesLiteral};
+window.__electrobunEventBridge = window.__electrobunEventBridge ||
+(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.eventBridge) ||
+window.eventBridge ||
+(window.chrome && window.chrome.webview && window.chrome.webview.hostObjects && window.chrome.webview.hostObjects.eventBridge);
+window.__electrobunInternalBridge = window.__electrobunInternalBridge ||
+(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.internalBridge) ||
+window.internalBridge ||
+(window.chrome && window.chrome.webview && window.chrome.webview.hostObjects && window.chrome.webview.hostObjects.internalBridge);
+window.__electrobunBunBridge = window.__electrobunBunBridge ||
+(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bunBridge) ||
+window.bunBridge ||
+(window.chrome && window.chrome.webview && window.chrome.webview.hostObjects && window.chrome.webview.hostObjects.bunBridge);
 `;
 				selectedPreloadScript = preloadScript;
 			}

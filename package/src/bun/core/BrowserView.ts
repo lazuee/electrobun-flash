@@ -197,7 +197,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 				? jsonMessage
 				: JSON.stringify(jsonMessage);
 		// todo (yoav): make this a shared const with the browser api
-		const wrappedMessage = `window.__electrobun.receiveMessageFromBun(${stringifiedMessage})`;
+		const wrappedMessage = `window.__electrobun && window.__electrobun.receiveMessageFromBun && window.__electrobun.receiveMessageFromBun(${stringifiedMessage})`;
 		this.executeJavascript(wrappedMessage);
 	}
 
@@ -207,7 +207,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 				? jsonMessage
 				: JSON.stringify(jsonMessage);
 		// todo (yoav): make this a shared const with the browser api
-		const wrappedMessage = `window.__electrobun.receiveInternalMessageFromBun(${stringifiedMessage})`;
+		const wrappedMessage = `window.__electrobun && window.__electrobun.receiveInternalMessageFromBun && window.__electrobun.receiveInternalMessageFromBun(${stringifiedMessage})`;
 		this.executeJavascript(wrappedMessage);
 	}
 
