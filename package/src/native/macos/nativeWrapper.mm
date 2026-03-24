@@ -8548,6 +8548,15 @@ static GlobalShortcutCallback g_globalShortcutCallback = nullptr;
 static NSMutableDictionary<NSString*, id> *g_globalShortcuts = nil;
 static NSLock *g_globalShortcutsLock = nil;
 
+// Register/remove NSEvent monitors on the main thread.
+static void runOnMainThreadSync(void (^block)(void)) {
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), block);
+    }
+}
+
 // Helper to parse modifier flags from accelerator string using the shared
 // cross-platform parser from accelerator_parser.h.
 static NSEventModifierFlags parseModifiers(NSString *accelerator, NSString **outKey) {
@@ -8643,29 +8652,45 @@ extern "C" BOOL registerGlobalShortcut(const char* accelerator) {
     // Create a copy of accelerator for the block
     NSString *accelCopy = [accelStr copy];
 
-    // Create global monitor
-    id monitor = [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskKeyDown
-        handler:^(NSEvent *event) {
-            // Check if the key and modifiers match
+    __block id globalMonitor = nil;
+    __block id localMonitor = nil;
+    runOnMainThreadSync(^{
+        void (^triggerIfMatch)(NSEvent *) = ^(NSEvent *event) {
             if (event.keyCode == keyCode) {
-                // Mask out irrelevant modifier bits (like caps lock, fn, etc.)
                 NSEventModifierFlags relevantMask = (NSEventModifierFlagCommand |
                                                      NSEventModifierFlagControl |
                                                      NSEventModifierFlagOption |
                                                      NSEventModifierFlagShift);
                 NSEventModifierFlags eventMods = event.modifierFlags & relevantMask;
 
-                if (eventMods == modifiers) {
-                    // Trigger the callback
-                    if (g_globalShortcutCallback) {
-                        g_globalShortcutCallback([accelCopy UTF8String]);
-                    }
+                if (eventMods == modifiers && g_globalShortcutCallback) {
+                    g_globalShortcutCallback([accelCopy UTF8String]);
                 }
             }
-        }];
+        };
 
-    if (monitor) {
-        g_globalShortcuts[accelStr] = monitor;
+        // Global monitor catches shortcuts while app is not focused.
+        globalMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+            handler:^(NSEvent *event) {
+                triggerIfMatch(event);
+            }];
+
+        // For older CEF builds, also monitor local keydown events because
+        // global monitors do not fire for key events generated in this app.
+        if (CEF_BELOW_V87) {
+            localMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                handler:^NSEvent *(NSEvent *event) {
+                    triggerIfMatch(event);
+                    return event;
+                }];
+        }
+    });
+
+    if (globalMonitor || localMonitor) {
+        g_globalShortcuts[accelStr] = @{
+            @"global": globalMonitor ?: [NSNull null],
+            @"local": localMonitor ?: [NSNull null],
+        };
         [g_globalShortcutsLock unlock];
         NSLog(@"[GlobalShortcut] Registered: %@ (keyCode: %d, modifiers: 0x%lX)",
               accelStr, keyCode, (unsigned long)modifiers);
@@ -8685,9 +8710,25 @@ extern "C" BOOL unregisterGlobalShortcut(const char* accelerator) {
 
     [g_globalShortcutsLock lock];
 
-    id monitor = g_globalShortcuts[accelStr];
-    if (monitor) {
-        [NSEvent removeMonitor:monitor];
+    id monitorEntry = g_globalShortcuts[accelStr];
+    if (monitorEntry) {
+        id globalMonitor = nil;
+        id localMonitor = nil;
+        if ([monitorEntry isKindOfClass:[NSDictionary class]]) {
+            globalMonitor = monitorEntry[@"global"];
+            localMonitor = monitorEntry[@"local"];
+            if ([globalMonitor isKindOfClass:[NSNull class]]) globalMonitor = nil;
+            if ([localMonitor isKindOfClass:[NSNull class]]) localMonitor = nil;
+        } else {
+            // Backward compatibility with previous single-monitor entries.
+            globalMonitor = monitorEntry;
+        }
+
+        runOnMainThreadSync(^{
+            if (globalMonitor) [NSEvent removeMonitor:globalMonitor];
+            if (localMonitor) [NSEvent removeMonitor:localMonitor];
+        });
+
         [g_globalShortcuts removeObjectForKey:accelStr];
         [g_globalShortcutsLock unlock];
         NSLog(@"[GlobalShortcut] Unregistered: %@", accelStr);
@@ -8702,10 +8743,24 @@ extern "C" BOOL unregisterGlobalShortcut(const char* accelerator) {
 extern "C" void unregisterAllGlobalShortcuts(void) {
     [g_globalShortcutsLock lock];
 
-    for (NSString *key in g_globalShortcuts) {
-        id monitor = g_globalShortcuts[key];
-        [NSEvent removeMonitor:monitor];
-    }
+    NSArray<id> *monitorEntries = [g_globalShortcuts allValues];
+    runOnMainThreadSync(^{
+        for (id monitorEntry in monitorEntries) {
+            id globalMonitor = nil;
+            id localMonitor = nil;
+            if ([monitorEntry isKindOfClass:[NSDictionary class]]) {
+                globalMonitor = monitorEntry[@"global"];
+                localMonitor = monitorEntry[@"local"];
+                if ([globalMonitor isKindOfClass:[NSNull class]]) globalMonitor = nil;
+                if ([localMonitor isKindOfClass:[NSNull class]]) localMonitor = nil;
+            } else {
+                globalMonitor = monitorEntry;
+            }
+            if (globalMonitor) [NSEvent removeMonitor:globalMonitor];
+            if (localMonitor) [NSEvent removeMonitor:localMonitor];
+        }
+    });
+
     [g_globalShortcuts removeAllObjects];
 
     [g_globalShortcutsLock unlock];
