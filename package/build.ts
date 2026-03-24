@@ -104,6 +104,8 @@ function getCefMajorVersion(versionString: string): number | null {
 const CEF_MAJOR_VERSION = getCefMajorVersion(CEF_VERSION);
 const FORCE_X64_FOR_CEF87 =
 	ARCH === "arm64" && CEF_MAJOR_VERSION !== null && CEF_MAJOR_VERSION <= 87;
+const SHOULD_ENABLE_PEPPER_FLASH =
+	CEF_MAJOR_VERSION !== null && CEF_MAJOR_VERSION <= 87;
 const BUILD_ARCH: "arm64" | "x64" = FORCE_X64_FOR_CEF87 ? "x64" : ARCH;
 
 if (FORCE_X64_FOR_CEF87) {
@@ -485,6 +487,7 @@ async function setup() {
 	await vendorZstd(); // GitHub
 	await vendorAsar(); // GitHub
 	await vendorWGPU(); // GitHub
+	await vendorPepperFlash(); // Github
 	await vendorZig(); // ziglang.org (not GitHub)
 	await vendorCEF(); // Spotify CDN (not GitHub)
 	await vendorWebview2();
@@ -605,6 +608,24 @@ async function copyToDist() {
 				await $`cp ${d3dCompiler} dist/d3dcompiler_47.dll`;
 				console.log("✓ Copied d3dcompiler_47.dll to dist");
 			}
+		}
+	}
+
+	if (SHOULD_ENABLE_PEPPER_FLASH) {
+		const pepperFlashDir = join(process.cwd(), "vendors", "pepper-flash");
+		const pepperFlashSource =
+			OS === "macos"
+				? join(pepperFlashDir, "PepperFlashPlayer.plugin")
+				: OS === "linux"
+					? join(pepperFlashDir, "libpepflashplayer.so")
+					: join(pepperFlashDir, "pepflashplayer.dll");
+		if (existsSync(pepperFlashSource)) {
+			await $`cp -R ${pepperFlashSource} dist/`;
+			console.log("✓ Copied PepperFlash plugin to dist");
+		} else {
+			console.warn(
+				`PepperFlash plugin expected for CEF ${CEF_VERSION} but not found at ${pepperFlashSource}`,
+			);
 		}
 	}
 
@@ -1809,6 +1830,76 @@ async function vendorLinuxDeps() {
 			console.log("");
 		}
 		console.log("All required packages are installed");
+	}
+}
+
+async function vendorPepperFlash() {
+	if (!SHOULD_ENABLE_PEPPER_FLASH) {
+		return;
+	}
+	
+	const FLASH_VERSION = "1.0.0";
+	const flashDir = join(process.cwd(), "vendors", "pepper-flash");
+
+	// Platform-specific expected files
+	const expectedFile =
+		OS === "macos"
+			? join(flashDir, "PepperFlashPlayer.plugin")
+			: OS === "linux"
+				? join(flashDir, "libpepflashplayer.so")
+				: join(flashDir, "pepflashplayer.dll");
+
+	if (existsSync(expectedFile)) {
+		return;
+	}
+
+	await pauseForGitHub();
+	console.log("Downloading PepperFlash plugin...");
+
+	const flashPlatformMap: Record<string, string> = {
+		macos: "darwin",
+		win: "win32",
+		linux: "linux",
+	};
+	const flashPlatform = flashPlatformMap[OS];
+
+	const tempTarball = join("vendors", `pepper-flash-temp.tar.gz`);
+
+	try {
+		await $`mkdir -p vendors/pepper-flash`;
+		const tarballUrl = `https://github.com/lazuee/flashplayer-plugin/releases/download/v${FLASH_VERSION}/flashplayer-plugin-${flashPlatform}.tar.gz`;
+		console.log(`Downloading PepperFlash from: ${tarballUrl}`);
+		await $`rm -f "${tempTarball}"`;
+		const githubToken =
+			process.env["GITHUB_TOKEN"] ??
+			process.env["GH_TOKEN"] ??
+			process.env["GITHUB_ACCESS_TOKEN"];
+		if (githubToken) {
+			await $`curl -fL -H "Authorization: Bearer ${githubToken}" -H "Accept: application/octet-stream" "${tarballUrl}" -o "${tempTarball}"`;
+		} else {
+			await $`curl -fL -H "Accept: application/octet-stream" "${tarballUrl}" -o "${tempTarball}"`;
+		}
+		validateDownload(tempTarball, "pepper-flash");
+
+		await $`tar -xzf "${tempTarball}" -C vendors/pepper-flash`;
+
+		await $`rm "${tempTarball}"`;
+
+		if (!existsSync(expectedFile)) {
+			throw new Error(
+				`PepperFlash plugin not found after extraction: ${expectedFile}`,
+			);
+		}
+
+		console.log("✓ PepperFlash plugin downloaded successfully");
+	} catch (error: unknown) {
+		console.error(
+			"Failed to download PepperFlash plugin:",
+			error instanceof Error ? error.message : error,
+		);
+		throw new Error(
+			`Failed to download PepperFlash plugin. Please try again in a minute.`,
+		);
 	}
 }
 

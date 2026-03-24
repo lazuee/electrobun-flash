@@ -129,6 +129,9 @@ function getPlatformPaths(
 		CEF_HELPER_WIN: join(platformDistDir, "process_helper.exe"),
 		CEF_HELPER_LINUX: join(platformDistDir, "process_helper"),
 		CEF_DIR: join(platformDistDir, "cef"),
+		PEPPER_FLASH_MACOS: join(platformDistDir, "PepperFlashPlayer.plugin"),
+		PEPPER_FLASH_WIN: join(platformDistDir, "pepflashplayer.dll"),
+		PEPPER_FLASH_LINUX: join(platformDistDir, "libpepflashplayer.so"),
 
 		// Shared platform-independent files (from dist/)
 		// These work with existing package.json and development workflow
@@ -2521,6 +2524,36 @@ Categories=Utility;Application;
 			(targetOS === "win" && config.build.win?.bundleCEF) ||
 			(targetOS === "linux" && config.build.linux?.bundleCEF)
 		) {
+			const targetCEFVersion = config.build.cefVersion || DEFAULT_CEF_VERSION_STRING;
+			const targetCEFMajor = getCefMajorVersion(targetCEFVersion);
+			const shouldBundlePepperFlash =
+				targetCEFMajor !== null && targetCEFMajor <= 87;
+
+			if (shouldBundlePepperFlash) {
+				const pepperFlashSource =
+					targetOS === "macos"
+						? targetPaths.PEPPER_FLASH_MACOS
+						: targetOS === "linux"
+							? targetPaths.PEPPER_FLASH_LINUX
+							: targetPaths.PEPPER_FLASH_WIN;
+				if (existsSync(pepperFlashSource)) {
+					const pepperFlashName = basename(pepperFlashSource);
+					const pepperFlashDestination = join(
+						appBundleMacOSPath,
+						pepperFlashName,
+					);
+					cpSync(pepperFlashSource, pepperFlashDestination, {
+						recursive: true,
+						dereference: true,
+					});
+					console.log(`Bundled Pepper Flash plugin: ${pepperFlashName}`);
+				} else {
+					console.warn(
+						`Pepper Flash expected for CEF ${targetCEFVersion} but not found at ${pepperFlashSource}`,
+					);
+				}
+			}
+
 			const effectiveCEFDir = await ensureCEFDependencies(
 				currentTarget.os,
 				currentTarget.arch,

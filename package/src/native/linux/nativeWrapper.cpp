@@ -111,6 +111,9 @@ using electrobun::OperationGuard;
 #else
 #include "include/cef_permission_handler.h"
 #endif
+#if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR <= 87)
+#include "../shared/ppapi_flash.h"
+#endif
 #include "include/cef_dialog_handler.h"
 #include "include/cef_download_handler.h"
 #include "include/wrapper/cef_helpers.h"
@@ -770,7 +773,7 @@ public:
         // Linux default flags — can be overridden via chromiumFlags in config
         // GPU acceleration disabled by default for VM compatibility;
         // skip with e.g. chromiumFlags: { "disable-gpu": false }
-        static const std::vector<electrobun::DefaultFlag> defaults = {
+        std::vector<electrobun::DefaultFlag> defaults = {
             {"use-mock-keychain", ""},
             {"disable-gpu", ""},
             {"disable-gpu-compositing", ""},
@@ -783,16 +786,29 @@ public:
             {"disable-gpu-memory-buffer-video-frames", ""},
             {"disable-dev-shm-usage", ""},
             {"disable-extensions", ""},
-            {"disable-plugins", ""},
             {"disable-web-security", ""},
             {"no-sandbox", ""},
             {"ozone-platform", "x11"},
             {"use-x11", ""},
+            {"autoplay-policy", "no-user-gesture-required"},
         };
+        if (!CEF_BELOW_V87) {
+            defaults.push_back({"disable-plugins", ""});
+        }
         electrobun::applyDefaultFlags(defaults, g_userChromiumFlags.skip, command_line);
 
         // Apply user-defined chromium flags from build.json
         electrobun::applyChromiumFlags(g_userChromiumFlags, command_line);
+
+        if (CEF_BELOW_V87) {
+            const std::string flashPath = electrobun::getPepperFlashPath();
+            if (!flashPath.empty()) {
+                command_line->AppendSwitch("enable-system-flash");
+                command_line->AppendSwitch("allow-outdated-plugins");
+                command_line->AppendSwitchWithValue("ppapi-flash-path", flashPath);
+                command_line->AppendSwitchWithValue("ppapi-flash-version", "32.0.0.465");
+            }
+        }
     }
     
     void OnRegisterCustomSchemes(CefRawPtr<CefSchemeRegistrar> registrar) override {
@@ -3631,6 +3647,16 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
 
     // Create isolated context with partition-specific settings
     CefRefPtr<CefRequestContext> context = CefRequestContext::CreateContext(settings, nullptr);
+
+    if (CEF_BELOW_V87) {
+        // Allow plugins (PPAPI Flash) by default — value 1 = CONTENT_SETTING_ALLOW
+        CefString error;
+        CefRefPtr<CefValue> pluginVal = CefValue::Create();
+        pluginVal->SetInt(1);
+        if (!context->SetPreference("profile.default_content_setting_values.plugins", pluginVal, error)) {
+            fprintf(stderr, "DEBUG CEF: Failed to set plugins preference: %s\n", error.ToString().c_str());
+        }
+    }
     
     // Register the views:// scheme handler factory on this context
     // This ensures the context can load views:// URLs while maintaining partition isolation

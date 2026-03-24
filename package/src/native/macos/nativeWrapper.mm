@@ -86,6 +86,9 @@ static bool wgpuDebugEnabled() {
 #include "../shared/app_paths.h"
 #include "../shared/accelerator_parser.h"
 #include "../shared/chromium_flags.h"
+#if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR <= 87)
+#include "../shared/ppapi_flash.h"
+#endif
 
 using namespace electrobun;
 
@@ -4478,11 +4481,23 @@ public:
             {"enable-fullscreen", ""},
             {"remote-allow-origins", "*"},
             {"allow-insecure-localhost", ""},
+            {"allow-running-insecure-content", ""},
+            {"autoplay-policy", "no-user-gesture-required"},
         };
         electrobun::applyDefaultFlags(defaults, g_userChromiumFlags.skip, command_line);
 
         // Apply user-defined chromium flags from build.json
         electrobun::applyChromiumFlags(g_userChromiumFlags, command_line);
+
+        if (CEF_BELOW_V87) {
+            const std::string flashPath = electrobun::getPepperFlashPath();
+            if (!flashPath.empty()) {
+                command_line->AppendSwitch("enable-system-flash");
+                command_line->AppendSwitch("allow-outdated-plugins");
+                command_line->AppendSwitchWithValue("ppapi-flash-path", flashPath);
+                command_line->AppendSwitchWithValue("ppapi-flash-version", "32.0.0.465");
+            }
+        }
     }
     void OnRegisterCustomSchemes(CefRawPtr<CefSchemeRegistrar> registrar) override {        
         registrar->AddCustomScheme("views", 
@@ -6274,6 +6289,16 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
   }
 
   CefRefPtr<CefRequestContext> context = CefRequestContext::CreateContext(settings, nullptr);
+
+    if (CEF_BELOW_V87) {
+        // Allow plugins (PPAPI Flash) by default — value 1 = CONTENT_SETTING_ALLOW
+        CefString error;
+        CefRefPtr<CefValue> pluginVal = CefValue::Create();
+        pluginVal->SetInt(1);
+        if (!context->SetPreference("profile.default_content_setting_values.plugins", pluginVal, error)) {
+            NSLog(@"DEBUG CEF: Failed to set plugins preference: %s", error.ToString().c_str());
+        }
+    }
 
   // Register scheme handler factory for this request context
   // Note: Each CefRequestContext needs its own registration - it's not global
