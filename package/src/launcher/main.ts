@@ -205,7 +205,7 @@ function main() {
 		// This runs in the Worker thread, not the main thread (which gets blocked by startEventLoop)
 		const wrappedFileData = `
 // Auto-delete temp file after Worker loads it
-const __tempFilePath = "${appEntrypointPath}";
+const __tempFilePath = ${JSON.stringify(appEntrypointPath)};
 setTimeout(() => {
     try {
         require("fs").unlinkSync(__tempFilePath);

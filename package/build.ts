@@ -956,7 +956,15 @@ async function vendorZig() {
 		// Always use x64 for Windows since we only build x64 Windows binaries
 		const zigArch = "x86_64";
 		const zigFolder = `zig-windows-${zigArch}-0.13.0`;
-		await $`mkdir -p vendors/zig && curl -L https://ziglang.org/download/0.13.0/${zigFolder}.zip -o vendors/zig.zip && powershell -ExecutionPolicy Bypass -Command Expand-Archive -Path vendors/zig.zip -DestinationPath vendors/zig-temp && mv vendors/zig-temp/${zigFolder}/zig.exe vendors/zig && mv vendors/zig-temp/${zigFolder}/lib vendors/zig/`;
+		await $`mkdir -p vendors/zig`;
+		await $`rm -f vendors/zig.zip`;
+		await $`rm -rf vendors/zig-temp`;
+		await $`curl -L https://ziglang.org/download/0.13.0/${zigFolder}.zip -o vendors/zig.zip`;
+		await $`powershell -ExecutionPolicy Bypass -Command "Expand-Archive -Path 'vendors/zig.zip' -DestinationPath 'vendors/zig-temp' -Force"`;
+		await $`mv vendors/zig-temp/${zigFolder}/zig.exe vendors/zig`;
+		await $`mv vendors/zig-temp/${zigFolder}/lib vendors/zig/`;
+		await $`rm -rf vendors/zig-temp`;
+		await $`rm -f vendors/zig.zip`;
 	} else if (OS === "linux") {
 		const zigArch = BUILD_ARCH === "arm64" ? "aarch64" : "x86_64";
 		await $`mkdir -p vendors/zig && curl -L https://ziglang.org/download/0.13.0/zig-linux-${zigArch}-0.13.0.tar.xz | tar -xJ --strip-components=1 -C vendors/zig zig-linux-${zigArch}-0.13.0/zig zig-linux-${zigArch}-0.13.0/lib zig-linux-${zigArch}-0.13.0/doc`;
