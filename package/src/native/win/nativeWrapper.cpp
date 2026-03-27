@@ -1311,8 +1311,12 @@ public:
                       const CefString& title,
                       const CefString& default_file_path,
                       const std::vector<CefString>& accept_filters,
+                    #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
                       const std::vector<CefString>& accept_extensions,
                       const std::vector<CefString>& accept_descriptions,
+                    #else
+                      int selected_accept_filter,
+                    #endif
                       CefRefPtr<CefFileDialogCallback> callback) override {
         
         printf("CEF Windows: File dialog requested - mode: %d\n", static_cast<int>(mode));
@@ -1320,7 +1324,11 @@ public:
         // Run file dialog on main thread using Windows native dialog
         HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         if (FAILED(hr)) {
-            callback->Continue(std::vector<CefString>());
+            #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+                callback->Continue(std::vector<CefString>());
+            #else
+                callback->Continue(selected_accept_filter, std::vector<CefString>());
+            #endif
             return true;
         }
         
@@ -1328,7 +1336,11 @@ public:
         hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_IFileOpenDialog, (void**)&pFileDialog);
         if (FAILED(hr)) {
             CoUninitialize();
-            callback->Continue(std::vector<CefString>());
+            #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+                callback->Continue(std::vector<CefString>());
+            #else
+                callback->Continue(selected_accept_filter, std::vector<CefString>());
+            #endif
             return true;
         }
         
@@ -1444,8 +1456,12 @@ public:
         CoUninitialize();
         
         // Call the callback with results
-        callback->Continue(file_paths);
-        
+        #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+            callback->Continue(file_paths);
+        #else
+            callback->Continue(selected_accept_filter, file_paths);
+        #endif
+
         printf("CEF Windows: File dialog completed with %zu files selected\n", file_paths.size());
         return true; // We handled the dialog
     }
@@ -2186,7 +2202,13 @@ public:
         #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
             windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
         #endif
-        windowInfo.SetAsChild((CefWindowHandle)host.window, cefRect);
+        
+        #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+            windowInfo.SetAsChild((CefWindowHandle)host.window, cefRect);
+        #else
+            RECT childRect = {(LONG)cefRect.x, (LONG)cefRect.y, (LONG)(cefRect.x + cefRect.width), (LONG)(cefRect.y + cefRect.height)};
+            windowInfo.SetAsChild((CefWindowHandle)host.window, childRect);
+        #endif
 
         CefBrowserSettings settings;
         host.browser = CefBrowserHost::CreateBrowserSync(
@@ -3996,7 +4018,11 @@ public:
         }
 
         // Use CEF's native find functionality
-        host->Find(CefString(searchText), forward, matchCase, false);
+        #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+            host->Find(CefString(searchText), forward, matchCase, false);
+        #else
+            host->Find(0, CefString(searchText), forward, matchCase, false);
+        #endif
     }
 
     void stopFindInPage() override {
@@ -6794,6 +6820,17 @@ static std::shared_ptr<CEFView> createCEFView(uint32_t webviewId,
             ::log("ERROR: Failed to create container");
             return;
         }
+
+        HWND containerHwnd = container->GetHwnd();
+        if (!IsWindowVisible(containerHwnd)) {
+            ShowWindow(containerHwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(containerHwnd);
+        }
+        // Also ensure the parent is visible
+        if (!IsWindowVisible(hwnd)) {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(hwnd);
+        }
         
         // Create CEF browser info
         CefWindowInfo windowInfo;
@@ -6829,7 +6866,12 @@ static std::shared_ptr<CEFView> createCEFView(uint32_t webviewId,
             windowInfo.SetAsWindowless(hwnd);
         } else {
             // Use windowed mode
-            windowInfo.SetAsChild(container->GetHwnd(), cefBounds);
+            #if defined(CEF_VERSION_MAJOR) && (CEF_VERSION_MAJOR > 87)
+                windowInfo.SetAsChild(container->GetHwnd(), cefBounds);
+            #else
+                RECT childRect = {(LONG)cefBounds.x, (LONG)cefBounds.y, (LONG)(cefBounds.x + cefBounds.width), (LONG)(cefBounds.y + cefBounds.height)};
+                windowInfo.SetAsChild(container->GetHwnd(), childRect);
+            #endif
         }
         
         // Set up preload scripts
@@ -7459,14 +7501,16 @@ static PFN_wgpuTextureRelease p_wgpuTextureRelease = nullptr;
 static PFN_wgpuCommandBufferRelease p_wgpuCommandBufferRelease = nullptr;
 static PFN_wgpuCommandEncoderRelease p_wgpuCommandEncoderRelease = nullptr;
 
-static std::wstring getExecutableDirW() {
-    wchar_t buffer[MAX_PATH];
-    DWORD len = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-    if (len == 0 || len == MAX_PATH) return L".";
-    std::wstring path(buffer, len);
-    size_t pos = path.find_last_of(L"\\/");
-    if (pos == std::wstring::npos) return L".";
-    return path.substr(0, pos);
+extern "C++" {
+    static std::wstring getExecutableDirW() {
+        wchar_t buffer[MAX_PATH];
+        DWORD len = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+        if (len == 0 || len == MAX_PATH) return L".";
+        std::wstring path(buffer, len);
+        size_t pos = path.find_last_of(L"\\/");
+        if (pos == std::wstring::npos) return L".";
+        return path.substr(0, pos);
+    }
 }
 
 static HMODULE loadWgpuLibrary() {
