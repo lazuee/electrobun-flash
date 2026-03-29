@@ -408,6 +408,52 @@ typedef void (*callAsyncJavascriptCompletionHandler)(const char *messageId, uint
 typedef SnapshotCallback zigSnapshotCallback;
 typedef StatusItemHandler ZigStatusItemHandler;
 
+template <typename CallbackT>
+static bool isValidFFICallback(CallbackT callback) {
+    if (!callback) {
+        return false;
+    }
+
+    uintptr_t ptr = reinterpret_cast<uintptr_t>(callback);
+    return ptr != static_cast<uintptr_t>(-1);
+}
+
+// Serialize native->Bun callback invocation to reduce cross-thread trampoline contention.
+// Recursive mutex allows same-thread re-entrant callback flows.
+static std::recursive_mutex g_ffiCallbackInvokeMutex;
+
+template <typename CallbackT, typename... Args>
+static bool invokeFFICallback(const char* callbackName, CallbackT callback, Args... args) {
+    if (!isValidFFICallback(callback)) {
+        fprintf(stderr,
+                "[electrobun] Skipping invalid callback pointer for %s\n",
+                callbackName ? callbackName : "(unknown)");
+        return false;
+    }
+
+    g_ffiCallbackInvokeMutex.lock();
+
+#if defined(_MSC_VER)
+    __try {
+        (void)callback(args...);
+        g_ffiCallbackInvokeMutex.unlock();
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        fprintf(stderr,
+                "[electrobun] Exception 0x%08X while invoking callback %s\n",
+                (unsigned int)GetExceptionCode(),
+                callbackName ? callbackName : "(unknown)");
+        g_ffiCallbackInvokeMutex.unlock();
+        return false;
+    }
+#else
+    (void)callback(args...);
+    g_ffiCallbackInvokeMutex.unlock();
+    return true;
+#endif
+}
+
 // Global map to store container views by window handle
 static std::map<HWND, std::unique_ptr<ContainerView>> g_containerViews;
 static GetMimeType g_getMimeType = nullptr;
@@ -1055,7 +1101,7 @@ public:
                                        "\",\"isCmdClick\":true,\"modifierFlags\":0}";
                 printf("[CEF OnBeforeBrowse] Firing new-window-open: %s\n", eventData.c_str());
                 // Use strdup to create persistent copies for the FFI callback
-                webview_event_handler_(webview_id_, _strdup("new-window-open"), _strdup(eventData.c_str()));
+                invokeFFICallback("webview_event_handler_", webview_event_handler_, webview_id_, _strdup("new-window-open"), _strdup(eventData.c_str()));
                 return true;  // Cancel navigation
             } else {
                 printf("[CEF OnBeforeBrowse] Debounced - too soon after last ctrl+click\n");
@@ -1065,8 +1111,12 @@ public:
         // Check navigation rules synchronously from native-stored rules
         // Navigation is allowed by default
         bool shouldAllow = true;
-        if (abstract_view_) {
-            shouldAllow = checkNavigationRules(abstract_view_, url);
+        {
+            std::lock_guard<std::mutex> lock(g_abstractViewsMutex);
+            auto viewIt = g_abstractViews.find(webview_id_);
+            if (viewIt != g_abstractViews.end() && viewIt->second) {
+                shouldAllow = checkNavigationRules(viewIt->second, url);
+            }
         }
 
         // Fire will-navigate event with allowed status
@@ -1082,7 +1132,7 @@ public:
             }
             std::string eventData = "{\"url\":\"" + escapedUrl + "\",\"allowed\":" +
                                    (shouldAllow ? "true" : "false") + "}";
-            webview_event_handler_(webview_id_, _strdup("will-navigate"), _strdup(eventData.c_str()));
+            invokeFFICallback("webview_event_handler_", webview_event_handler_, webview_id_, _strdup("will-navigate"), _strdup(eventData.c_str()));
         }
 
         return !shouldAllow;  // Return true to cancel navigation
@@ -1939,7 +1989,7 @@ public:
         // eventBridge - event-only bridge (always process for all webviews, including sandboxed)
         if (messageName == "EventBridgeMessage") {
             if (event_bridge_handler_) {
-                event_bridge_handler_(webview_id_, contentCopy);
+                invokeFFICallback("event_bridge_handler_", event_bridge_handler_, webview_id_, contentCopy);
             }
             return true;
         }
@@ -1947,12 +1997,12 @@ public:
         else if (!is_sandboxed_) {
             if (messageName == "BunBridgeMessage") {
                 if (bun_bridge_handler_) {
-                    bun_bridge_handler_(webview_id_, contentCopy);
+                    invokeFFICallback("bun_bridge_handler_", bun_bridge_handler_, webview_id_, contentCopy);
                 }
                 return true;
             } else if (messageName == "internalMessage") {
                 if (webview_tag_handler_) {
-                    webview_tag_handler_(webview_id_, contentCopy);
+                    invokeFFICallback("webview_tag_handler_", webview_tag_handler_, webview_id_, contentCopy);
                 }
                 return true;
             }
@@ -2399,7 +2449,7 @@ void ElectrobunLoadHandler::OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<C
     // Fire did-navigate event
     if (frame->IsMain() && webview_event_handler_) {
         std::string url = frame->GetURL().ToString();
-        webview_event_handler_(webview_id_, _strdup("did-navigate"), _strdup(url.c_str()));
+        invokeFFICallback("webview_event_handler_", webview_event_handler_, webview_id_, _strdup("did-navigate"), _strdup(url.c_str()));
     }
 
     // Call load end callback for deferred operations (like transparency)
@@ -2593,10 +2643,7 @@ public:
         strcpy_s(messageCopy, strlen(message_char) + 1, message_char);
 
         // Call the callback
-        try {
-            m_callback(m_webviewId, messageCopy);
-        } catch (...) {
-            ::log("ERROR: Exception in bridge callback");
+        if (!invokeFFICallback(m_bridgeName.c_str(), m_callback, m_webviewId, messageCopy)) {
             delete[] message_char;
             delete[] messageCopy;
             return E_FAIL;
@@ -3086,6 +3133,8 @@ private:
     HandlePostMessage internalBridgeCallbackHandler;
     bool isSandboxed;
     HWND containerHwnd = nullptr;  // Container window for masking
+    std::atomic<bool> isRemoved{false};
+    LONG_PTR ownerWindowUserData = 0;
 
 public:
     std::string pendingUrl;
@@ -3126,6 +3175,29 @@ public:
 
     void setCreationComplete(bool complete) {
         isCreationComplete = complete;
+    }
+
+    void setOwnerWindowUserData(LONG_PTR userData) {
+        ownerWindowUserData = userData;
+    }
+
+    bool isValidForAsyncCallbacks() const {
+        if (isRemoved.load()) {
+            return false;
+        }
+
+        if (!hwnd || !IsWindow(hwnd)) {
+            return false;
+        }
+
+        if (ownerWindowUserData != 0) {
+            LONG_PTR currentUserData = GetWindowLongPtr(hwnd, GWLP_USERDATA);
+            if (currentUserData != ownerWindowUserData) {
+                return false;
+            }
+        }
+
+        return true;
     }
     
     bool isReady() const {
@@ -3255,6 +3327,7 @@ public:
     }
     
     void remove() override {
+        isRemoved.store(true);
         if (controller) {
             controller->Close();
             controller = nullptr;
@@ -3679,13 +3752,18 @@ public:
             browser = nullptr;
             client = nullptr;
 
-            // Defer the actual browser close to avoid synchronous window message issues
-            // Use CloseBrowser(true) to force close since we return true from DoClose
-            // to prevent CEF from sending WM_CLOSE to parent window
-            MainThreadDispatcher::dispatch_async([host]() {
-                std::cout << "[CEF] Calling CloseBrowser(true) from dispatch_async" << std::endl;
+            // Close immediately on the UI thread so teardown completes before
+            // the parent/container lifecycle advances to the next window.
+            auto closeBrowserNow = [host]() {
+                std::cout << "[CEF] Calling CloseBrowser(true)" << std::endl;
                 host->CloseBrowser(true);  // force=true since DoClose returns true
-            });
+            };
+
+            if (GetCurrentThreadId() == g_mainThreadId) {
+                closeBrowserNow();
+            } else {
+                MainThreadDispatcher::dispatch_sync(closeBrowserNow);
+            }
         }
     }
     
@@ -4254,19 +4332,22 @@ private:
         if (msg == WM_NCCREATE) {
             CREATESTRUCT* cs = (CREATESTRUCT*)lParam;
             container = (ContainerView*)cs->lpCreateParams;
+            if (container) {
+                container->m_hwnd = hwnd;
+            }
             SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)container);
         } else {
             container = (ContainerView*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
         }
         
         if (container) {
-            return container->HandleMessage(msg, wParam, lParam);
+            return container->HandleMessage(hwnd, msg, wParam, lParam);
         }
         
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     
-    LRESULT HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
+    LRESULT HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         switch (msg) {
             case WM_SIZE: {
                 // // Resize all full-size webviews when container resizes
@@ -4298,14 +4379,14 @@ private:
             
             case WM_PAINT: {
                 PAINTSTRUCT ps;
-                HDC hdc = BeginPaint(m_hwnd, &ps);
+                HDC hdc = BeginPaint(hwnd, &ps);
                 // Don't draw anything - let child windows handle their own painting
-                EndPaint(m_hwnd, &ps);
+                EndPaint(hwnd, &ps);
                 return 0;
             }
         }
         
-        return DefWindowProc(m_hwnd, msg, wParam, lParam);
+        return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     
     void UpdateActiveWebviewForMousePosition(POINT mousePos) {
@@ -4471,12 +4552,15 @@ public:
         }
         
         // Register our custom window class for proper event handling
+        static const char* kContainerViewClassName = "ElectrobunContainerViewClass";
+        DWORD customClassError = 0;
+        char customClassErrorMsg[256] = {0};
         static bool classRegistered = false;
         if (!classRegistered) {
             WNDCLASSA wc = {0};
             wc.lpfnWndProc = ContainerWndProc;
             wc.hInstance = GetModuleHandle(NULL);
-            wc.lpszClassName = "ContainerViewClass";
+            wc.lpszClassName = kContainerViewClassName;
             wc.hbrBackground = NULL; // Transparent background
             wc.hCursor = LoadCursor(NULL, IDC_ARROW);
             wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -4497,7 +4581,7 @@ public:
         // Try creating with our custom class first
         m_hwnd = CreateWindowExA(
             0,
-            "ContainerViewClass",
+            kContainerViewClassName,
             "",  // No title text
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
             0, 0, width, height,
@@ -4508,7 +4592,9 @@ public:
         );
         
         if (!m_hwnd) {
-            ::log("Custom class failed, falling back to STATIC class");
+            customClassError = GetLastError();
+            sprintf_s(customClassErrorMsg, "Custom class failed (error: %lu), falling back to STATIC class", customClassError);
+            ::log(customClassErrorMsg);
             
             use_static_class:
             // Fallback to STATIC class
@@ -4591,9 +4677,8 @@ public:
     
     ~ContainerView() {
         // Explicitly remove each view before destroying HWNDs.
-        // This lets CEFView::remove() defer CloseBrowser via dispatch_async
-        // instead of ~CEFView() calling CloseBrowser(true) synchronously
-        // on an already-destroyed HWND (which would crash).
+        // This closes browser views while the container hierarchy is still valid,
+        // avoiding close-time races against parent HWND destruction.
         for (auto& view : m_abstractViews) {
             g_pendingResizeQueue.remove(view.get());
             view->remove();
@@ -4640,23 +4725,28 @@ ContainerView* GetOrCreateContainer(HWND parentWindow) {
     }
     
     auto it = g_containerViews.find(parentWindow);
-    if (it == g_containerViews.end()) {
-        
-        auto container = std::make_unique<ContainerView>(parentWindow);
-        ContainerView* containerPtr = container.get();
-        
-        // Only store if creation was successful
-        if (containerPtr->GetHwnd() != NULL) {
-            g_containerViews[parentWindow] = std::move(container);
-            return containerPtr;
-        } else {
-            ::log("ERROR: Container creation failed, not storing");
-            return nullptr;
+    if (it != g_containerViews.end()) {
+        ContainerView* existing = it->second.get();
+        HWND existingHwnd = existing ? existing->GetHwnd() : NULL;
+        if (existingHwnd != NULL && IsWindow(existingHwnd)) {
+            return existing;
         }
+
+        ::log("WARN: Found stale container entry; recreating container window");
+        g_containerViews.erase(it);
     }
-    
-    // log("Using existing container for window");
-    return it->second.get();
+
+    auto container = std::make_unique<ContainerView>(parentWindow);
+    ContainerView* containerPtr = container.get();
+
+    // Only store if creation was successful
+    if (containerPtr->GetHwnd() != NULL) {
+        g_containerViews[parentWindow] = std::move(container);
+        return containerPtr;
+    } else {
+        ::log("ERROR: Container creation failed, not storing");
+        return nullptr;
+    }
 }
 
 // Stub classes for compatibility
@@ -4946,14 +5036,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (GetKeyState(VK_MENU) & 0x8000) modifiers |= 1 << 2;
                     uint32_t isDown = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) ? 1 : 0;
                     uint32_t isRepeat = (lParam & (1 << 30)) ? 1 : 0;
-                    data->keyHandler(data->windowId, keyCode, modifiers, isDown, isRepeat);
+                    invokeFFICallback("WindowKeyHandler", data->keyHandler, data->windowId, keyCode, modifiers, isDown, isRepeat);
                 }
             }
             break;
 
         case WM_CLOSE:
             if (data && data->closeHandler) {
-                data->closeHandler(data->windowId);
+                invokeFFICallback("WindowCloseHandler", data->closeHandler, data->windowId);
             }
             break;
             
@@ -4961,7 +5051,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (data && data->moveHandler) {
                 int x = LOWORD(lParam);
                 int y = HIWORD(lParam);
-                data->moveHandler(data->windowId, x, y);
+                invokeFFICallback("WindowMoveHandler", data->moveHandler, data->windowId, x, y);
             }
             break;
             
@@ -4987,7 +5077,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (data && data->resizeHandler) {
                     int width = LOWORD(lParam);
                     int height = HIWORD(lParam);
-                    data->resizeHandler(data->windowId, 0, 0, width, height);
+                    invokeFFICallback("WindowResizeHandler", data->resizeHandler, data->windowId, 0, 0, width, height);
                 }
             }
             break;
@@ -4996,11 +5086,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Window activation - WA_ACTIVE or WA_CLICKACTIVE means window is being activated
             if (LOWORD(wParam) == WA_INACTIVE) {
                 if (data && data->blurHandler) {
-                    data->blurHandler(data->windowId);
+                    invokeFFICallback("WindowBlurHandler", data->blurHandler, data->windowId);
                 }
             } else {
                 if (data && data->focusHandler) {
-                    data->focusHandler(data->windowId);
+                    invokeFFICallback("WindowFocusHandler", data->focusHandler, data->windowId);
                 }
             }
             break;
@@ -5502,7 +5592,7 @@ void handleMenuItemSelection(UINT menuId, NSStatusItem* statusItem) {
                     PostQuitMessage(0);
                 }
             } else {
-                statusItem->handler(statusItem->trayId, action.c_str());
+                invokeFFICallback("StatusItemHandler", statusItem->handler, statusItem->trayId, action.c_str());
             }
         }
     }
@@ -6018,13 +6108,15 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
         ShowWindow(containerHwnd, SW_SHOW);
         UpdateWindow(containerHwnd);
         
+        // Track the initial window user-data pointer so async callbacks can detect
+        // stale HWND reuse after a window is destroyed and recreated.
+        view->setOwnerWindowUserData(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+
         // Create WebView2 environment
-        // Store values to avoid complex object captures in lambda
-        uint32_t webviewId = view->webviewId;
         HWND parentHwnd = hwnd;
         
         auto environmentCompletedHandler = Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [view, container, x, y, width, height, transparent](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+            [view, parentHwnd, x, y, width, height, transparent](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
                 if (FAILED(result)) {
                     char errorMsg[256];
                     sprintf_s(errorMsg, "ERROR: Failed to create WebView2 environment, HRESULT: 0x%08X", result);
@@ -6032,9 +6124,21 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                     view->setCreationFailed(true);
                     return result;
                 }
+
+                if (!view->isValidForAsyncCallbacks()) {
+                    view->setCreationFailed(true);
+                    return S_OK;
+                }
+
+                auto activeContainer = GetOrCreateContainer(parentHwnd);
+                if (!activeContainer) {
+                    ::log("ERROR: WebView2 environment callback could not resolve container");
+                    view->setCreationFailed(true);
+                    return S_OK;
+                }
                 
                 // Create WebView2 controller - MINIMAL VERSION
-                HWND targetHwnd = container->GetHwnd();
+                HWND targetHwnd = activeContainer->GetHwnd();
                 
                 if (!IsWindow(targetHwnd)) {
                     ::log("ERROR: Target window is no longer valid");
@@ -6044,13 +6148,41 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                 
                 return env->CreateCoreWebView2Controller(targetHwnd,
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [view, container, x, y, width, height, env, transparent](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
+                        [view, parentHwnd, x, y, width, height, env, transparent](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
                             if (FAILED(result)) {
                                 char errorMsg[256];
                                 sprintf_s(errorMsg, "ERROR: Failed to create WebView2 controller, HRESULT: 0x%08X", result);
                                 ::log(errorMsg);
                                 view->setCreationFailed(true);
                                 return result;
+                            }
+
+                            if (!view->isValidForAsyncCallbacks()) {
+                                if (controller) {
+                                    controller->Close();
+                                }
+                                view->setCreationFailed(true);
+                                return S_OK;
+                            }
+
+                            auto activeContainer = GetOrCreateContainer(parentHwnd);
+                            if (!activeContainer) {
+                                ::log("ERROR: WebView2 controller callback could not resolve container");
+                                if (controller) {
+                                    controller->Close();
+                                }
+                                view->setCreationFailed(true);
+                                return S_OK;
+                            }
+
+                            HWND activeContainerHwnd = activeContainer->GetHwnd();
+                            if (!IsWindow(activeContainerHwnd)) {
+                                ::log("ERROR: WebView2 container HWND became invalid before controller setup");
+                                if (controller) {
+                                    controller->Close();
+                                }
+                                view->setCreationFailed(true);
+                                return S_OK;
                             }
                             
                             
@@ -6072,7 +6204,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                             }
 
                             // Store container HWND for masking support
-                            view->setContainerHwnd(container->GetHwnd());
+                            view->setContainerHwnd(activeContainerHwnd);
 
                             // Set up JavaScript bridge objects
                             view->setupJavaScriptBridges();
@@ -6263,7 +6395,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                                                 std::string eventData = "{\"url\":\"" + escapedUrl +
                                                                        "\",\"isCmdClick\":true,\"modifierFlags\":0}";
                                                 printf("[WebView2 NavigationStarting] Firing new-window-open: %s\n", eventData.c_str());
-                                                capturedHandler(capturedWebviewId, _strdup("new-window-open"), _strdup(eventData.c_str()));
+                                                invokeFFICallback("WebView2NavigationStarting", capturedHandler, capturedWebviewId, _strdup("new-window-open"), _strdup(eventData.c_str()));
 
                                                 args->put_Cancel(TRUE);
                                                 return S_OK;
@@ -6295,7 +6427,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                                             }
                                             std::string eventData = "{\"url\":\"" + escapedUrl + "\",\"allowed\":" +
                                                                    (shouldAllow ? "true" : "false") + "}";
-                                            capturedHandler(capturedWebviewId, _strdup("will-navigate"), _strdup(eventData.c_str()));
+                                            invokeFFICallback("WebView2WillNavigate", capturedHandler, capturedWebviewId, _strdup("will-navigate"), _strdup(eventData.c_str()));
                                         }
 
                                         // Cancel navigation if not allowed
@@ -6337,7 +6469,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                                                 }
                                             }
                                             std::string eventData = "{\"url\":\"" + escapedUrl + "\"}";
-                                            capturedHandler(capturedWebviewId, _strdup("did-navigate"), _strdup(eventData.c_str()));
+                                            invokeFFICallback("WebView2DidNavigate", capturedHandler, capturedWebviewId, _strdup("did-navigate"), _strdup(eventData.c_str()));
                                         }
 
                                         return S_OK;
@@ -6588,7 +6720,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                             }
                             
                             view->setCreationComplete(true);
-                            container->AddAbstractView(view);
+                            activeContainer->AddAbstractView(view);
 
                             // Apply deferred initial transparent/passthrough state now that view is ready
                             if (view->pendingStartTransparent) {
@@ -6607,8 +6739,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                             }
 
                             // Store WebView2View in global map for JavaScript execution
-                            HWND containerHwnd = container->GetHwnd();
-                            g_webview2Views[containerHwnd] = view.get();
+                            g_webview2Views[activeContainerHwnd] = view.get();
 
 
                             return S_OK;
@@ -6678,11 +6809,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                 // If no partition specified, use default WebView2 folder (shared)
 
                 // Convert to wide string for WebView2 API
-                int wideSize = MultiByteToWideChar(CP_UTF8, 0, userDataPath.c_str(), -1, nullptr, 0);
-                if (wideSize > 0) {
-                    userDataFolder.resize(wideSize - 1);
-                    MultiByteToWideChar(CP_UTF8, 0, userDataPath.c_str(), -1, &userDataFolder[0], wideSize);
-                }
+                userDataFolder = StringToWString(userDataPath);
 
                 // Create directory if it doesn't exist
                 // Use SHCreateDirectoryExW for recursive creation
@@ -6822,6 +6949,11 @@ static std::shared_ptr<CEFView> createCEFView(uint32_t webviewId,
         }
 
         HWND containerHwnd = container->GetHwnd();
+        if (!containerHwnd || !IsWindow(containerHwnd)) {
+            ::log("ERROR: Container window handle is invalid before CEF SetAsChild");
+            return;
+        }
+
         if (!IsWindowVisible(containerHwnd)) {
             ShowWindow(containerHwnd, SW_SHOWNOACTIVATE);
             UpdateWindow(containerHwnd);
@@ -6892,8 +7024,21 @@ static std::shared_ptr<CEFView> createCEFView(uint32_t webviewId,
 
         // Set up load-end callback for deferred transparency/passthrough application
         // CEF navigation events can reset window state, so we re-apply after page load
-        CEFView* viewPtr = view.get();
-        client->SetLoadEndCallback([viewPtr]() {
+        uint32_t callbackWebviewId = view->webviewId;
+        client->SetLoadEndCallback([callbackWebviewId]() {
+            CEFView* viewPtr = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_abstractViewsMutex);
+                auto it = g_abstractViews.find(callbackWebviewId);
+                if (it != g_abstractViews.end() && it->second) {
+                    viewPtr = dynamic_cast<CEFView*>(it->second);
+                }
+            }
+
+            if (!viewPtr) {
+                return;
+            }
+
             if (viewPtr->pendingStartTransparent) {
                 viewPtr->setTransparent(true);
                 viewPtr->pendingStartTransparent = false;
@@ -8839,23 +8984,17 @@ ELECTROBUN_EXPORT void setWindowTitle(NSWindow *window, const char *title) {
     // Dispatch to main thread to ensure thread safety
     MainThreadDispatcher::dispatch_sync([=]() {
         if (title && strlen(title) > 0) {
-            // Convert UTF-8 to wide string for Unicode support
-            int size = MultiByteToWideChar(CP_UTF8, 0, title, -1, NULL, 0);
-            if (size > 0) {
-                std::wstring wTitle(size - 1, 0);
-                MultiByteToWideChar(CP_UTF8, 0, title, -1, &wTitle[0], size);
-                
-                // Set the window title
-                if (SetWindowTextW(hwnd, wTitle.c_str())) {
-                    
-                } else {
-                    DWORD error = GetLastError();
-                    char errorMsg[256];
-                    sprintf_s(errorMsg, "Failed to set window title, error: %lu", error);
-                    ::log(errorMsg);
-                }
+            // Convert UTF-8 to UTF-16 with helper to avoid null-terminator overrun.
+            std::wstring wTitle = StringToWString(std::string(title));
+
+            // Set the window title
+            if (SetWindowTextW(hwnd, wTitle.c_str())) {
+
             } else {
-                ::log("ERROR: Failed to convert title to wide string");
+                DWORD error = GetLastError();
+                char errorMsg[256];
+                sprintf_s(errorMsg, "Failed to set window title, error: %lu", error);
+                ::log(errorMsg);
             }
         } else {
             // Set empty title
@@ -8881,30 +9020,22 @@ ELECTROBUN_EXPORT void closeWindow(NSWindow *window) {
 
     // Dispatch to main thread to ensure thread safety
     MainThreadDispatcher::dispatch_sync([=]() {
-
-
         // Clean up any associated container views before closing
         auto containerIt = g_containerViews.find(hwnd);
         if (containerIt != g_containerViews.end()) {
             g_containerViews.erase(containerIt);
         }
 
-        // Send WM_CLOSE message to the window
-        // This will trigger the window's close handler if one is set
-        if (PostMessage(hwnd, WM_CLOSE, 0, 0)) {
-        } else {
-            DWORD error = GetLastError();
-            char errorMsg[256];
-            sprintf_s(errorMsg, "Failed to send WM_CLOSE message, error: %lu", error);
-            ::log(errorMsg);
+        // Close synchronously to avoid queued WM_CLOSE targeting a recycled HWND.
+        SendMessage(hwnd, WM_CLOSE, 0, 0);
 
-            // If PostMessage fails, try DestroyWindow as a fallback
-            ::log("Attempting DestroyWindow as fallback");
-            if (DestroyWindow(hwnd)) {
-            } else {
+        // If WM_CLOSE was ignored and the window still exists, force destroy.
+        if (IsWindow(hwnd)) {
+            ::log("WM_CLOSE did not destroy window, forcing DestroyWindow");
+            if (!DestroyWindow(hwnd)) {
                 DWORD destroyError = GetLastError();
                 char destroyErrorMsg[256];
-                sprintf_s(destroyErrorMsg, "DestroyWindow also failed, error: %lu", destroyError);
+                sprintf_s(destroyErrorMsg, "DestroyWindow failed, error: %lu", destroyError);
                 ::log(destroyErrorMsg);
             }
         }
@@ -10224,7 +10355,7 @@ void handleTrayIconMessage(HWND hwnd, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONUP:
             // Handle left click on tray icon
             if (statusItem && statusItem->handler) {
-                statusItem->handler(statusItem->trayId, "");
+                invokeFFICallback("StatusItemHandler", statusItem->handler, statusItem->trayId, "");
             }
             break;
     }
@@ -10883,7 +11014,7 @@ static LRESULT CALLBACK HotkeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         std::lock_guard<std::mutex> lock(g_hotkeyMutex);
         auto it = g_hotkeyIdToAccelerator.find(hotkeyId);
         if (it != g_hotkeyIdToAccelerator.end() && g_globalShortcutCallback) {
-            g_globalShortcutCallback(it->second.c_str());
+            invokeFFICallback("GlobalShortcutCallback", g_globalShortcutCallback, it->second.c_str());
         }
         return 0;
     }
