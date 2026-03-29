@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "chromium Docs": {
+      "type": "sse",
+      "url": "https://gitmcp.io/chromium/chromium/tree/87.0.4280.141"
+    }
+  }
+}

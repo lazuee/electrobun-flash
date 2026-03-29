@@ -1,0 +1,11 @@
+{
+    "chat.mcp.serverSampling": {
+        "electrobun-flash/.vscode/mcp.json: chromium Docs": {
+            "allowedModels": [
+                "copilot/auto",
+                "copilotcli/gpt-5.3-codex",
+                "copilot/gpt-5.3-codex"
+            ]
+        }
+    }
+}
