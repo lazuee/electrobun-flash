@@ -276,34 +276,20 @@ class CarrotInstance {
       void this.stop();
     };
 
-    const shouldCreateControllerWindow =
-      this.carrot.manifest.view?.relativePath != null &&
-      (this.carrot.manifest.mode === "window" ||
-       this.carrot.manifest.view.hidden !== true);
-
-    if (shouldCreateControllerWindow) {
-      bootLog("creating carrot controller window", {
-        id: this.carrot.manifest.id,
-        url: this.carrot.viewUrl,
-      });
-      this.createControllerWindow("main");
-    } else {
-      bootLog("skipping controller window (no view)", {
-        id: this.carrot.manifest.id,
-      });
-      // For worker-only carrots (no view), send init directly to the worker
-      // since there's no controller window dom-ready to trigger it.
-      this.worker!.postMessage({
-        type: "init",
-        manifest: this.carrot.manifest,
-        context: {
-          statePath: this.statePath,
-          logsPath: this.logsPath,
-          permissions: flattenCarrotPermissions(this.carrot.install.permissionsGranted),
-          grantedPermissions: this.carrot.install.permissionsGranted,
-        },
-      });
-    }
+    // Send init context to the worker so it has statePath, permissions, etc.
+    const channel = await Updater.localInfo.channel().catch(() => "dev");
+    this.worker!.postMessage({
+      type: "init",
+      manifest: this.carrot.manifest,
+      context: {
+        statePath: this.statePath,
+        logsPath: this.logsPath,
+        permissions: flattenCarrotPermissions(this.carrot.install.permissionsGranted),
+        grantedPermissions: this.carrot.install.permissionsGranted,
+        authToken: runtime.authToken || null,
+        channel: channel || "dev",
+      },
+    });
 
     this.status = "running";
     bootLog("carrot running", { id: this.carrot.manifest.id });
@@ -669,6 +655,22 @@ class CarrotInstance {
       case "screen-get-cursor-screen-point": {
         return Screen.getCursorScreenPoint();
       }
+      case "get-auth-token": {
+        return { token: runtime.authToken || null };
+      }
+      case "set-auth-token": {
+        const token = String((params as any)?.token || "");
+        if (token) {
+          (runtime as any).saveAuthToken(token);
+          // Notify all running carrots about the new token
+          for (const carrot of runtime.carrots.values()) {
+            if (carrot.status === "running") {
+              carrot.sendEvent("auth-token-changed", { token });
+            }
+          }
+        }
+        return { ok: true };
+      }
       case "list-carrots": {
         return runtime.summaries();
       }
@@ -864,8 +866,9 @@ class CarrotInstance {
         await this.toggleBunnyWindow(payload as { screenX?: number; screenY?: number } | undefined);
         break;
       }
-      case "open-manager": {
-        (runtime as any).openManagerWindow();
+      case "open-manager":
+      case "open-farm": {
+        void (runtime as any).handleTrayAction("open-farm");
         break;
       }
       case "remove-tray": {
@@ -1131,6 +1134,11 @@ class BunnyEarsRuntime {
 
     this.startWebBridge();
 
+    // Auto-open dash for development
+    this.handleTrayAction("open-dash").catch((err) => {
+      console.error("[bunny-ears] auto-open dash failed:", err);
+    });
+
     // Auth + instance registration — non-blocking, doesn't gate carrots
     this.loadAuthToken();
     if (this.authToken) {
@@ -1149,13 +1157,18 @@ class BunnyEarsRuntime {
     bootLog("runtime boot complete");
   }
 
+  private getAuthTokenPath() {
+    const path = require("node:path");
+    const os = require("node:os");
+    // Store auth token in ~/.electrobunny/ (global, not per-channel)
+    return path.join(os.homedir(), ".electrobunny", ".auth-token");
+  }
+
   private loadAuthToken() {
     const fs = require("node:fs");
-    const path = require("node:path");
-    const dataDir = Utils.getAppDataDir?.() || "";
-    const tokenPath = dataDir ? path.join(dataDir, ".auth-token") : "";
+    const tokenPath = this.getAuthTokenPath();
 
-    if (tokenPath && fs.existsSync(tokenPath)) {
+    if (fs.existsSync(tokenPath)) {
       try {
         this.authToken = fs.readFileSync(tokenPath, "utf8").trim();
         bootLog("loaded auth token");
@@ -1166,8 +1179,7 @@ class BunnyEarsRuntime {
   private saveAuthToken(token: string) {
     const fs = require("node:fs");
     const path = require("node:path");
-    const dataDir = Utils.getAppDataDir?.() || "";
-    const tokenPath = dataDir ? path.join(dataDir, ".auth-token") : "";
+    const tokenPath = this.getAuthTokenPath();
 
     this.authToken = token;
     if (tokenPath) {
@@ -1203,6 +1215,12 @@ class BunnyEarsRuntime {
             setAuthToken: ({ accessToken }: { accessToken: string }) => {
               this.saveAuthToken(accessToken);
               bootLog("received auth token from Farm");
+              // Notify all running carrots about the new token
+              for (const carrot of this.carrots.values()) {
+                if (carrot.status === "running") {
+                  carrot.sendEvent("auth-token-changed", { token: accessToken });
+                }
+              }
 
               // Keep the Farm window open — user can see their dashboard.
               // Resize to a comfortable dashboard size.
@@ -1211,6 +1229,23 @@ class BunnyEarsRuntime {
                 this.farmWindow.setTitle("Electrobunny Farm");
               }
               resolve();
+              return { ok: true };
+            },
+            clearAuthToken: () => {
+              this.authToken = null;
+              // Delete saved token
+              try {
+                const fs = require("node:fs");
+                const tokenPath = this.getAuthTokenPath();
+                if (fs.existsSync(tokenPath)) fs.unlinkSync(tokenPath);
+              } catch {}
+              // Notify all running carrots
+              for (const carrot of this.carrots.values()) {
+                if (carrot.status === "running") {
+                  carrot.sendEvent("auth-token-cleared");
+                }
+              }
+              bootLog("auth token cleared");
               return { ok: true };
             },
           },
@@ -1565,9 +1600,15 @@ class BunnyEarsRuntime {
   private async handleTrayAction(action: string) {
     if (action === "open-dash") {
       const dashCarrot = this.carrots.get("bunny-dash");
-      if (dashCarrot && dashCarrot.status === "running") {
-        await dashCarrot.openWindow();
+      if (!dashCarrot) return;
+      if (dashCarrot.status !== "running") {
+        await dashCarrot.start();
+        dashCarrot.sendEvent("boot");
       }
+      // Set dash as active menu owner so menu clicks route to it
+      this.activeApplicationMenuOwnerId = dashCarrot.carrot.manifest.id;
+      // Dash manages its own windows — send an event to focus/create
+      dashCarrot.sendEvent("open-window");
       return;
     }
     if (action === "open-farm") {

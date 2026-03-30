@@ -705,22 +705,97 @@ export const native = (() => {
 			// },
 		});
 	} catch (err) {
-		console.log("FATAL Error opening native FFI:", (err as Error).message);
-		console.log("This may be due to:");
-		console.log("  - Missing libNativeWrapper.dll/so/dylib");
-		console.log("  - Architecture mismatch (ARM64 vs x64)");
-		console.log("  - Missing WebView2 or CEF dependencies");
-		if (suffix === "so") {
-			console.log(
-				"  - Missing system libraries (try: ldd ./libNativeWrapper.so)",
-			);
-		}
-		console.log(
-			"Check that the build process completed successfully for your architecture.",
-		);
-		process.exit();
+		// FFI not available — running as a carrot inside Bunny Ears or in a build-only context.
+		return null;
 	}
 })();
+
+export const hasFFI = native !== null;
+
+// PostMessage bridge for carrot workers (inter-carrot communication, host events).
+// Created when __bunnyCarrotBootstrap exists, regardless of FFI availability.
+class PostMessageBridge {
+	private requestId = 0;
+	private pendingRequests = new Map<number, {
+		resolve: (value: unknown) => void;
+		reject: (error: Error) => void;
+	}>();
+	private eventHandlers = new Map<string, Set<(payload: unknown) => void>>();
+
+	constructor() {
+		if (typeof self !== "undefined" && typeof self.addEventListener === "function") {
+			self.addEventListener("message", (event: MessageEvent) => {
+				this.handleMessage(event.data);
+			});
+		}
+	}
+
+	sendAction(action: string, payload?: unknown) {
+		self.postMessage({ type: "action", action, payload });
+	}
+
+	requestHost<T = unknown>(method: string, params?: unknown): Promise<T> {
+		const id = ++this.requestId;
+		self.postMessage({ type: "host-request", requestId: id, method, params });
+		return new Promise<T>((resolve, reject) => {
+			this.pendingRequests.set(id, {
+				resolve: (v) => resolve(v as T),
+				reject,
+			});
+		});
+	}
+
+	on(name: string, handler: (payload: unknown) => void) {
+		const handlers = this.eventHandlers.get(name) ?? new Set();
+		handlers.add(handler);
+		this.eventHandlers.set(name, handlers);
+		return () => {
+			handlers.delete(handler);
+			if (handlers.size === 0) this.eventHandlers.delete(name);
+		};
+	}
+
+	emit(name: string, payload: unknown) {
+		this.eventHandlers.get(name)?.forEach((h) => {
+			try { h(payload); } catch (e) { console.error(`[bridge] event handler failed: ${name}`, e); }
+		});
+	}
+
+	private handleMessage(message: any) {
+		if (!message || typeof message !== "object" || !("type" in message)) return;
+
+		if (message.type === "host-response") {
+			const pending = this.pendingRequests.get(message.requestId);
+			if (!pending) return;
+			this.pendingRequests.delete(message.requestId);
+			if (message.success) {
+				pending.resolve(message.payload);
+			} else {
+				pending.reject(new Error(message.error || "Host request failed"));
+			}
+		} else if (message.type === "event") {
+			this.emit(message.name, message.payload);
+		} else if (message.type === "init") {
+			this.emit("init", message);
+		}
+	}
+}
+
+const isCarrotWorker = !!(globalThis as any).__bunnyCarrotBootstrap;
+export const bridge: PostMessageBridge | null = isCarrotWorker ? new PostMessageBridge() : null;
+
+// Proxy wrapper: routes ffi.request calls through FFI when available,
+// or through the postMessage bridge when running as a carrot without FFI.
+function createFfiRequestProxy(ffiRequest: Record<string, Function>): Record<string, Function> {
+	if (hasFFI) return ffiRequest;
+
+	return new Proxy(ffiRequest, {
+		get(target, method: string) {
+			if (typeof method !== "string") return target[method];
+			return (params?: unknown) => bridge!.requestHost(method, params);
+		},
+	});
+}
 
 // const _callbacks: unknown[] = [];
 
@@ -728,7 +803,10 @@ export const native = (() => {
 // in only about 8 going through then params after that. I think it may be similar to
 // a zig bug I ran into last year. So check number of args in a signature when alignment issues occur.
 
-export const ffi = {
+// Non-null accessor for use inside _ffiImpl — these methods are only called when hasFFI is true.
+const native_ = native!;
+
+const _ffiImpl = {
 	request: {
 		createWindow: (params: {
 			id: number;
@@ -782,7 +860,7 @@ export const ffi = {
 				hidden = false,
 			} = params;
 
-			const styleMask = native.symbols.getWindowStyle(
+			const styleMask = native_.symbols.getWindowStyle(
 				Borderless,
 				Titled,
 				Closable,
@@ -797,7 +875,7 @@ export const ffi = {
 				HUDWindow,
 			);
 
-			const windowPtr = native.symbols.createWindowWithFrameAndStyleFromWorker(
+			const windowPtr = native_.symbols.createWindowWithFrameAndStyleFromWorker(
 				id,
 				// frame
 				x,
@@ -821,9 +899,9 @@ export const ffi = {
 				throw "Failed to create window";
 			}
 
-			native.symbols.setWindowTitle(windowPtr, toCString(title));
+			native_.symbols.setWindowTitle(windowPtr, toCString(title));
 			if (!hidden) {
-				native.symbols.showWindow(windowPtr);
+				native_.symbols.showWindow(windowPtr);
 			}
 
 			return windowPtr;
@@ -836,7 +914,7 @@ export const ffi = {
 				throw `Can't add webview to window. window no longer exists`;
 			}
 
-			native.symbols.setWindowTitle(windowPtr, toCString(title));
+			native_.symbols.setWindowTitle(windowPtr, toCString(title));
 		},
 
 		closeWindow: (params: { winId: number }) => {
@@ -848,7 +926,7 @@ export const ffi = {
 				return;
 			}
 
-			native.symbols.closeWindow(windowPtr);
+			native_.symbols.closeWindow(windowPtr);
 			// Note: Cleanup of BrowserWindowMap happens in the windowCloseCallback
 		},
 
@@ -860,7 +938,7 @@ export const ffi = {
 				throw `Can't focus window. Window no longer exists`;
 			}
 
-			native.symbols.showWindow(windowPtr);
+			native_.symbols.showWindow(windowPtr);
 		},
 
 		minimizeWindow: (params: { winId: number }) => {
@@ -871,7 +949,7 @@ export const ffi = {
 				throw `Can't minimize window. Window no longer exists`;
 			}
 
-			native.symbols.minimizeWindow(windowPtr);
+			native_.symbols.minimizeWindow(windowPtr);
 		},
 
 		restoreWindow: (params: { winId: number }) => {
@@ -882,7 +960,7 @@ export const ffi = {
 				throw `Can't restore window. Window no longer exists`;
 			}
 
-			native.symbols.restoreWindow(windowPtr);
+			native_.symbols.restoreWindow(windowPtr);
 		},
 
 		isWindowMinimized: (params: { winId: number }): boolean => {
@@ -893,7 +971,7 @@ export const ffi = {
 				return false;
 			}
 
-			return native.symbols.isWindowMinimized(windowPtr);
+			return native_.symbols.isWindowMinimized(windowPtr);
 		},
 
 		maximizeWindow: (params: { winId: number }) => {
@@ -904,7 +982,7 @@ export const ffi = {
 				throw `Can't maximize window. Window no longer exists`;
 			}
 
-			native.symbols.maximizeWindow(windowPtr);
+			native_.symbols.maximizeWindow(windowPtr);
 		},
 
 		unmaximizeWindow: (params: { winId: number }) => {
@@ -915,7 +993,7 @@ export const ffi = {
 				throw `Can't unmaximize window. Window no longer exists`;
 			}
 
-			native.symbols.unmaximizeWindow(windowPtr);
+			native_.symbols.unmaximizeWindow(windowPtr);
 		},
 
 		isWindowMaximized: (params: { winId: number }): boolean => {
@@ -926,7 +1004,7 @@ export const ffi = {
 				return false;
 			}
 
-			return native.symbols.isWindowMaximized(windowPtr);
+			return native_.symbols.isWindowMaximized(windowPtr);
 		},
 
 		setWindowFullScreen: (params: { winId: number; fullScreen: boolean }) => {
@@ -937,7 +1015,7 @@ export const ffi = {
 				throw `Can't set fullscreen. Window no longer exists`;
 			}
 
-			native.symbols.setWindowFullScreen(windowPtr, fullScreen);
+			native_.symbols.setWindowFullScreen(windowPtr, fullScreen);
 		},
 
 		isWindowFullScreen: (params: { winId: number }): boolean => {
@@ -948,7 +1026,7 @@ export const ffi = {
 				return false;
 			}
 
-			return native.symbols.isWindowFullScreen(windowPtr);
+			return native_.symbols.isWindowFullScreen(windowPtr);
 		},
 
 		setWindowAlwaysOnTop: (params: { winId: number; alwaysOnTop: boolean }) => {
@@ -959,7 +1037,7 @@ export const ffi = {
 				throw `Can't set always on top. Window no longer exists`;
 			}
 
-			native.symbols.setWindowAlwaysOnTop(windowPtr, alwaysOnTop);
+			native_.symbols.setWindowAlwaysOnTop(windowPtr, alwaysOnTop);
 		},
 
 		isWindowAlwaysOnTop: (params: { winId: number }): boolean => {
@@ -970,7 +1048,7 @@ export const ffi = {
 				return false;
 			}
 
-			return native.symbols.isWindowAlwaysOnTop(windowPtr);
+			return native_.symbols.isWindowAlwaysOnTop(windowPtr);
 		},
 
 		setWindowVisibleOnAllWorkspaces: (params: {
@@ -984,7 +1062,7 @@ export const ffi = {
 				throw `Can't set visible on all workspaces. Window no longer exists`;
 			}
 
-			native.symbols.setWindowVisibleOnAllWorkspaces(
+			native_.symbols.setWindowVisibleOnAllWorkspaces(
 				windowPtr,
 				visibleOnAllWorkspaces,
 			);
@@ -998,7 +1076,7 @@ export const ffi = {
 				return false;
 			}
 
-			return native.symbols.isWindowVisibleOnAllWorkspaces(windowPtr);
+			return native_.symbols.isWindowVisibleOnAllWorkspaces(windowPtr);
 		},
 
 		setWindowPosition: (params: { winId: number; x: number; y: number }) => {
@@ -1009,7 +1087,7 @@ export const ffi = {
 				throw `Can't set window position. Window no longer exists`;
 			}
 
-			native.symbols.setWindowPosition(windowPtr, x, y);
+			native_.symbols.setWindowPosition(windowPtr, x, y);
 		},
 
 		setWindowSize: (params: {
@@ -1024,7 +1102,7 @@ export const ffi = {
 				throw `Can't set window size. Window no longer exists`;
 			}
 
-			native.symbols.setWindowSize(windowPtr, width, height);
+			native_.symbols.setWindowSize(windowPtr, width, height);
 		},
 
 		setWindowFrame: (params: {
@@ -1041,7 +1119,7 @@ export const ffi = {
 				throw `Can't set window frame. Window no longer exists`;
 			}
 
-			native.symbols.setWindowFrame(windowPtr, x, y, width, height);
+			native_.symbols.setWindowFrame(windowPtr, x, y, width, height);
 		},
 
 		getWindowFrame: (params: {
@@ -1060,7 +1138,7 @@ export const ffi = {
 			const widthBuf = new Float64Array(1);
 			const heightBuf = new Float64Array(1);
 
-			native.symbols.getWindowFrame(
+			native_.symbols.getWindowFrame(
 				windowPtr,
 				ptr(xBuf),
 				ptr(yBuf),
@@ -1186,8 +1264,8 @@ window.bunBridge ||
 			const customPreload = preload;
 
 			// Pre-set flags before initWebview (workaround for FFI param count limits)
-			native.symbols.setNextWebviewFlags(startTransparent, startPassthrough);
-			const webviewPtr = native.symbols.initWebview(
+			native_.symbols.setNextWebviewFlags(startTransparent, startPassthrough);
+			const webviewPtr = native_.symbols.initWebview(
 				id,
 				windowPtr,
 				toCString(renderer),
@@ -1244,7 +1322,7 @@ window.bunBridge ||
 				throw `Can't add WGPUView to window. window no longer exists`;
 			}
 
-			const viewPtr = native.symbols.initWGPUView(
+			const viewPtr = native_.symbols.initWGPUView(
 				id,
 				windowPtr,
 				x,
@@ -1278,7 +1356,7 @@ window.bunBridge ||
 				return;
 			}
 
-			native.symbols.wgpuViewSetFrame(
+			native_.symbols.wgpuViewSetFrame(
 				view.ptr,
 				params.x,
 				params.y,
@@ -1296,7 +1374,7 @@ window.bunBridge ||
 				return;
 			}
 
-			native.symbols.wgpuViewSetTransparent(view.ptr, params.transparent);
+			native_.symbols.wgpuViewSetTransparent(view.ptr, params.transparent);
 		},
 
 		wgpuViewSetPassthrough: (params: {
@@ -1311,7 +1389,7 @@ window.bunBridge ||
 				return;
 			}
 
-			native.symbols.wgpuViewSetPassthrough(view.ptr, params.passthrough);
+			native_.symbols.wgpuViewSetPassthrough(view.ptr, params.passthrough);
 		},
 
 		wgpuViewSetHidden: (params: { id: number; hidden: boolean }) => {
@@ -1323,7 +1401,7 @@ window.bunBridge ||
 				return;
 			}
 
-			native.symbols.wgpuViewSetHidden(view.ptr, params.hidden);
+			native_.symbols.wgpuViewSetHidden(view.ptr, params.hidden);
 		},
 
 		wgpuViewRemove: (params: { id: number }) => {
@@ -1335,7 +1413,7 @@ window.bunBridge ||
 				return;
 			}
 
-			native.symbols.wgpuViewRemove(view.ptr);
+			native_.symbols.wgpuViewRemove(view.ptr);
 		},
 		wgpuViewGetNativeHandle: (params: { id: number }): Pointer | null => {
 			const view = WGPUView.getById(params.id);
@@ -1346,7 +1424,7 @@ window.bunBridge ||
 				return null;
 			}
 
-			const handle = native.symbols.wgpuViewGetNativeHandle(view.ptr);
+			const handle = native_.symbols.wgpuViewGetNativeHandle(view.ptr);
 			return handle || null;
 		},
 
@@ -1361,7 +1439,7 @@ window.bunBridge ||
 				return;
 			}
 
-			native.symbols.evaluateJavaScriptWithNoCompletion(
+			native_.symbols.evaluateJavaScriptWithNoCompletion(
 				webview.ptr,
 				toCString(js),
 			);
@@ -1377,7 +1455,7 @@ window.bunBridge ||
 		}): FFIType.ptr => {
 			const { id, title, image, template, width, height } = params;
 
-			const trayPtr = native.symbols.createTray(
+			const trayPtr = native_.symbols.createTray(
 				id,
 				toCString(title),
 				toCString(image),
@@ -1399,7 +1477,7 @@ window.bunBridge ||
 			const tray = Tray.getById(id);
 			if (!tray) return;
 
-			native.symbols.setTrayTitle(tray.ptr, toCString(title));
+			native_.symbols.setTrayTitle(tray.ptr, toCString(title));
 		},
 		setTrayImage: (params: { id: number; image: string }): void => {
 			const { id, image } = params;
@@ -1407,7 +1485,7 @@ window.bunBridge ||
 			const tray = Tray.getById(id);
 			if (!tray) return;
 
-			native.symbols.setTrayImage(tray.ptr, toCString(image));
+			native_.symbols.setTrayImage(tray.ptr, toCString(image));
 		},
 		setTrayMenu: (params: {
 			id: number;
@@ -1419,7 +1497,7 @@ window.bunBridge ||
 			const tray = Tray.getById(id);
 			if (!tray) return;
 
-			native.symbols.setTrayMenu(tray.ptr, toCString(menuConfig));
+			native_.symbols.setTrayMenu(tray.ptr, toCString(menuConfig));
 		},
 
 		removeTray: (params: { id: number }): void => {
@@ -1430,7 +1508,7 @@ window.bunBridge ||
 				throw `Can't remove tray. Tray no longer exists`;
 			}
 
-			native.symbols.removeTray(tray.ptr);
+			native_.symbols.removeTray(tray.ptr);
 			// The Tray class will handle removing from TrayMap
 		},
 		getTrayBounds: (params: { id: number }): Rectangle => {
@@ -1439,7 +1517,7 @@ window.bunBridge ||
 				return { x: 0, y: 0, width: 0, height: 0 };
 			}
 
-			const jsonStr = native.symbols.getTrayBounds(tray.ptr);
+			const jsonStr = native_.symbols.getTrayBounds(tray.ptr);
 			if (!jsonStr) {
 				return { x: 0, y: 0, width: 0, height: 0 };
 			}
@@ -1453,7 +1531,7 @@ window.bunBridge ||
 		setApplicationMenu: (params: { menuConfig: string }): void => {
 			const { menuConfig } = params;
 
-			native.symbols.setApplicationMenu(
+			native_.symbols.setApplicationMenu(
 				toCString(menuConfig),
 				applicationMenuHandler,
 			);
@@ -1461,25 +1539,25 @@ window.bunBridge ||
 		showContextMenu: (params: { menuConfig: string }): void => {
 			const { menuConfig } = params;
 
-			native.symbols.showContextMenu(toCString(menuConfig), contextMenuHandler);
+			native_.symbols.showContextMenu(toCString(menuConfig), contextMenuHandler);
 		},
 		moveToTrash: (params: { path: string }): boolean => {
 			const { path } = params;
 
-			return native.symbols.moveToTrash(toCString(path));
+			return native_.symbols.moveToTrash(toCString(path));
 		},
 		showItemInFolder: (params: { path: string }): void => {
 			const { path } = params;
 
-			native.symbols.showItemInFolder(toCString(path));
+			native_.symbols.showItemInFolder(toCString(path));
 		},
 		openExternal: (params: { url: string }): boolean => {
 			const { url } = params;
-			return native.symbols.openExternal(toCString(url));
+			return native_.symbols.openExternal(toCString(url));
 		},
 		openPath: (params: { path: string }): boolean => {
 			const { path } = params;
-			return native.symbols.openPath(toCString(path));
+			return native_.symbols.openPath(toCString(path));
 		},
 		showNotification: (params: {
 			title: string;
@@ -1488,7 +1566,7 @@ window.bunBridge ||
 			silent?: boolean;
 		}): void => {
 			const { title, body = "", subtitle = "", silent = false } = params;
-			native.symbols.showNotification(
+			native_.symbols.showNotification(
 				toCString(title),
 				toCString(body),
 				toCString(subtitle),
@@ -1496,10 +1574,10 @@ window.bunBridge ||
 			);
 		},
 		setDockIconVisible: (params: { visible: boolean }): void => {
-			native.symbols.setDockIconVisible(params.visible);
+			native_.symbols.setDockIconVisible(params.visible);
 		},
 		isDockIconVisible: (): boolean => {
-			return native.symbols.isDockIconVisible();
+			return native_.symbols.isDockIconVisible();
 		},
 		openFileDialog: (params: {
 			startingFolder: string;
@@ -1515,7 +1593,7 @@ window.bunBridge ||
 				canChooseDirectory,
 				allowsMultipleSelection,
 			} = params;
-			const filePath = native.symbols.openFileDialog(
+			const filePath = native_.symbols.openFileDialog(
 				toCString(startingFolder),
 				toCString(allowedFileTypes),
 				canChooseFiles ? 1 : 0,
@@ -1545,7 +1623,7 @@ window.bunBridge ||
 			} = params;
 			// Convert buttons array to comma-separated string
 			const buttonsStr = buttons.join(",");
-			return native.symbols.showMessageBox(
+			return native_.symbols.showMessageBox(
 				toCString(type),
 				toCString(title),
 				toCString(message),
@@ -1558,17 +1636,17 @@ window.bunBridge ||
 
 		// Clipboard API
 		clipboardReadText: (): string | null => {
-			const result = native.symbols.clipboardReadText();
+			const result = native_.symbols.clipboardReadText();
 			if (!result) return null;
 			return result.toString();
 		},
 		clipboardWriteText: (params: { text: string }): void => {
-			native.symbols.clipboardWriteText(toCString(params.text));
+			native_.symbols.clipboardWriteText(toCString(params.text));
 		},
 		clipboardReadImage: (): Uint8Array | null => {
 			// Allocate a buffer for the size output
 			const sizeBuffer = new BigUint64Array(1);
-			const dataPtr = native.symbols.clipboardReadImage(ptr(sizeBuffer));
+			const dataPtr = native_.symbols.clipboardReadImage(ptr(sizeBuffer));
 
 			if (!dataPtr) return null;
 
@@ -1588,13 +1666,13 @@ window.bunBridge ||
 		},
 		clipboardWriteImage: (params: { pngData: Uint8Array }): void => {
 			const { pngData } = params;
-			native.symbols.clipboardWriteImage(ptr(pngData), BigInt(pngData.length));
+			native_.symbols.clipboardWriteImage(ptr(pngData), BigInt(pngData.length));
 		},
 		clipboardClear: (): void => {
-			native.symbols.clipboardClear();
+			native_.symbols.clipboardClear();
 		},
 		clipboardAvailableFormats: (): string[] => {
-			const result = native.symbols.clipboardAvailableFormats();
+			const result = native_.symbols.clipboardAvailableFormats();
 			if (!result) return [];
 			const formatsStr = result.toString();
 			if (!formatsStr) return [];
@@ -1606,7 +1684,7 @@ window.bunBridge ||
 
 		//   } = params;
 
-		//   native.symbols.ffifunc(
+		//   native_.symbols.ffifunc(
 
 		//   );
 		// },
@@ -1621,27 +1699,32 @@ window.bunBridge ||
 	},
 };
 
+export const ffi = {
+	request: createFfiRequestProxy(_ffiImpl.request as unknown as Record<string, Function>) as typeof _ffiImpl.request,
+	internal: _ffiImpl.internal,
+};
+
 export const WGPUBridge = {
 	available: !!native?.symbols?.wgpuInstanceCreateSurfaceMainThread,
 	instanceCreateSurface: (instancePtr: Pointer, descriptorPtr: Pointer): Pointer =>
-		native.symbols.wgpuInstanceCreateSurfaceMainThread(
+		native_.symbols.wgpuInstanceCreateSurfaceMainThread(
 			instancePtr as any,
 			descriptorPtr as any,
 		) as Pointer,
 	surfaceConfigure: (surfacePtr: Pointer, configPtr: Pointer) =>
-		native.symbols.wgpuSurfaceConfigureMainThread(
+		native_.symbols.wgpuSurfaceConfigureMainThread(
 			surfacePtr as any,
 			configPtr as any,
 		),
 	surfaceGetCurrentTexture: (surfacePtr: Pointer, surfaceTexturePtr: Pointer) =>
-		native.symbols.wgpuSurfaceGetCurrentTextureMainThread(
+		native_.symbols.wgpuSurfaceGetCurrentTextureMainThread(
 			surfacePtr as any,
 			surfaceTexturePtr as any,
 		),
 	surfacePresent: (surfacePtr: Pointer): number =>
-		native.symbols.wgpuSurfacePresentMainThread(surfacePtr as any),
+		native_.symbols.wgpuSurfacePresentMainThread(surfacePtr as any),
 	queueOnSubmittedWorkDone: (queuePtr: Pointer, callbackInfoPtr: Pointer): bigint =>
-		native.symbols.wgpuQueueOnSubmittedWorkDoneShim(
+		native_.symbols.wgpuQueueOnSubmittedWorkDoneShim(
 			queuePtr as any,
 			callbackInfoPtr as any,
 		),
@@ -1652,7 +1735,7 @@ export const WGPUBridge = {
 		size: bigint,
 		callbackInfoPtr: Pointer,
 	): bigint =>
-		native.symbols.wgpuBufferMapAsyncShim(
+		native_.symbols.wgpuBufferMapAsyncShim(
 			bufferPtr as any,
 			mode as any,
 			offset as any,
@@ -1664,7 +1747,7 @@ export const WGPUBridge = {
 		futureId: bigint,
 		timeoutNs: bigint,
 	): number =>
-		native.symbols.wgpuInstanceWaitAnyShim(
+		native_.symbols.wgpuInstanceWaitAnyShim(
 			instancePtr as any,
 			futureId as any,
 			timeoutNs as any,
@@ -1677,7 +1760,7 @@ export const WGPUBridge = {
 		timeoutNs: bigint,
 		outSizePtr: Pointer,
 	): Pointer =>
-		native.symbols.wgpuBufferReadSyncShim(
+		native_.symbols.wgpuBufferReadSyncShim(
 			instancePtr as any,
 			bufferPtr as any,
 			offset as any,
@@ -1693,7 +1776,7 @@ export const WGPUBridge = {
 		timeoutNs: bigint,
 		dstPtr: Pointer,
 	): number =>
-		native.symbols.wgpuBufferReadSyncIntoShim(
+		native_.symbols.wgpuBufferReadSyncIntoShim(
 			instancePtr as any,
 			bufferPtr as any,
 			offset as any,
@@ -1707,16 +1790,16 @@ export const WGPUBridge = {
 		size: bigint,
 		dstPtr: Pointer,
 	): Pointer =>
-		native.symbols.wgpuBufferReadbackBeginShim(
+		native_.symbols.wgpuBufferReadbackBeginShim(
 			bufferPtr as any,
 			offset as any,
 			size as any,
 			dstPtr as any,
 		) as Pointer,
 	bufferReadbackStatus: (jobPtr: Pointer): number =>
-		native.symbols.wgpuBufferReadbackStatusShim(jobPtr as any),
+		native_.symbols.wgpuBufferReadbackStatusShim(jobPtr as any),
 	bufferReadbackFree: (jobPtr: Pointer) =>
-		native.symbols.wgpuBufferReadbackFreeShim(jobPtr as any),
+		native_.symbols.wgpuBufferReadbackFreeShim(jobPtr as any),
 	runTest: (viewId: number) => {
 		const view = WGPUView.getById(viewId);
 		if (!view?.ptr) {
@@ -1727,31 +1810,34 @@ export const WGPUBridge = {
 			console.error("wgpuRunGPUTest not available");
 			return;
 		}
-		native.symbols.wgpuRunGPUTest(view.ptr);
+		native_.symbols.wgpuRunGPUTest(view.ptr);
 	},
 	createAdapterDeviceMainThread: (
 		instancePtr: Pointer,
 		surfacePtr: Pointer,
 		outAdapterDevicePtr: Pointer,
 	) =>
-		native.symbols.wgpuCreateAdapterDeviceMainThread(
+		native_.symbols.wgpuCreateAdapterDeviceMainThread(
 			instancePtr as any,
 			surfacePtr as any,
 			outAdapterDevicePtr as any,
 		),
 	createSurfaceForView: (instancePtr: Pointer, viewPtr: Pointer): Pointer | null => {
 		if (!native?.symbols?.wgpuCreateSurfaceForView) return null;
-		return native.symbols.wgpuCreateSurfaceForView(instancePtr as any, viewPtr as any) as Pointer;
+		return native_.symbols.wgpuCreateSurfaceForView(instancePtr as any, viewPtr as any) as Pointer;
 	},
 };
 
 // Worker management. Move to a different file
 process.on("uncaughtException", (err) => {
 	console.error("Uncaught exception in worker:", err);
-	// Fast path for crashes - skip beforeQuit, just stop the event loop
-	native.symbols.stopEventLoop();
-	native.symbols.waitForShutdownComplete(5000);
-	native.symbols.forceExit(1);
+	if (native) {
+		native_.symbols.stopEventLoop();
+		native_.symbols.waitForShutdownComplete(5000);
+		native_.symbols.forceExit(1);
+	} else {
+		process.exit(1);
+	}
 });
 
 process.on("unhandledRejection", (reason, _promise) => {
@@ -1933,88 +2019,60 @@ const getHTMLForWebviewSync = new JSCallback(
 	},
 );
 
-native.symbols.setJSUtils(getMimeType, getHTMLForWebviewSync);
+if (native) native_.symbols.setJSUtils(getMimeType, getHTMLForWebviewSync);
 
-// URL scheme open handler (macOS only)
-// Receives URLs when the app is opened via custom URL schemes (e.g., myapp://path)
-const urlOpenCallback = new JSCallback(
-	(urlPtr) => {
-		const url = new CString(urlPtr).toString();
-		const handler = electrobunEventEmitter.events.app.openUrl;
-		const event = handler({ url });
-		electrobunEventEmitter.emitEvent(event);
-	},
-	{
-		args: [FFIType.cstring],
-		returns: "void",
-		threadsafe: true,
-	},
-);
-
-// Register the URL open handler with native code (macOS only)
-if (process.platform === "darwin") {
-	native.symbols.setURLOpenHandler(urlOpenCallback);
-}
-
-const appReopenCallback = new JSCallback(
-	() => {
-		if (process.platform === "darwin") {
-			native.symbols.setDockIconVisible(true);
-		}
-
-		const handler = electrobunEventEmitter.events.app.reopen;
-		const event = handler({});
-		electrobunEventEmitter.emitEvent(event);
-	},
-	{
-		args: [],
-		returns: "void",
-		threadsafe: true,
-	},
-);
-
-if (process.platform === "darwin") {
-	native.symbols.setAppReopenHandler(appReopenCallback);
-}
-
-// Quit requested callback - invoked by native code when system quit is requested
-// (dock icon quit, menu quit, console close, etc.)
-const quitRequestedCallback = new JSCallback(
-	() => {
-		// Dynamic require to avoid circular dependency (Utils.ts imports from native.ts)
-		const { quit } = require("../core/Utils");
-		quit();
-	},
-	{
-		args: [],
-		returns: "void",
-		threadsafe: true,
-	},
-);
-
-// Register the quit handler with native code (all platforms)
-native.symbols.setQuitRequestedHandler(quitRequestedCallback);
-
-// Global shortcut storage and callback
+// Native-only init: URL scheme handlers, quit handler, global shortcuts.
+// Skipped when running without FFI (carrot mode).
 const globalShortcutHandlers = new Map<string, () => void>();
 
-const globalShortcutCallback = new JSCallback(
-	(acceleratorPtr) => {
-		const accelerator = new CString(acceleratorPtr).toString();
-		const handler = globalShortcutHandlers.get(accelerator);
-		if (handler) {
-			handler();
-		}
-	},
-	{
-		args: [FFIType.cstring],
-		returns: "void",
-		threadsafe: true,
-	},
-);
+if (native) {
+	const urlOpenCallback = new JSCallback(
+		(urlPtr) => {
+			const url = new CString(urlPtr).toString();
+			const handler = electrobunEventEmitter.events.app.openUrl;
+			const event = handler({ url });
+			electrobunEventEmitter.emitEvent(event);
+		},
+		{ args: [FFIType.cstring], returns: "void", threadsafe: true },
+	);
+	if (process.platform === "darwin") {
+		native_.symbols.setURLOpenHandler(urlOpenCallback);
+	}
 
-// Set up the global shortcut callback
-native.symbols.setGlobalShortcutCallback(globalShortcutCallback);
+	const appReopenCallback = new JSCallback(
+		() => {
+			if (process.platform === "darwin") {
+				native_.symbols.setDockIconVisible(true);
+			}
+			const handler = electrobunEventEmitter.events.app.reopen;
+			const event = handler({});
+			electrobunEventEmitter.emitEvent(event);
+		},
+		{ args: [], returns: "void", threadsafe: true },
+	);
+	if (process.platform === "darwin") {
+		native_.symbols.setAppReopenHandler(appReopenCallback);
+	}
+
+	const quitRequestedCallback = new JSCallback(
+		() => {
+			const { quit } = require("../core/Utils");
+			quit();
+		},
+		{ args: [], returns: "void", threadsafe: true },
+	);
+	native_.symbols.setQuitRequestedHandler(quitRequestedCallback);
+
+	const globalShortcutCallback = new JSCallback(
+		(acceleratorPtr) => {
+			const accelerator = new CString(acceleratorPtr).toString();
+			const handler = globalShortcutHandlers.get(accelerator);
+			if (handler) handler();
+		},
+		{ args: [FFIType.cstring], returns: "void", threadsafe: true },
+	);
+	native_.symbols.setGlobalShortcutCallback(globalShortcutCallback);
+}
 
 // GlobalShortcut module for external use
 export const GlobalShortcut = {
@@ -2025,49 +2083,24 @@ export const GlobalShortcut = {
 	 * @returns true if registered successfully, false otherwise
 	 */
 	register: (accelerator: string, callback: () => void): boolean => {
-		if (globalShortcutHandlers.has(accelerator)) {
-			return false; // Already registered
-		}
-
-		const result = native.symbols.registerGlobalShortcut(
-			toCString(accelerator),
-		);
-		if (result) {
-			globalShortcutHandlers.set(accelerator, callback);
-		}
+		if (!native || globalShortcutHandlers.has(accelerator)) return false;
+		const result = native_.symbols.registerGlobalShortcut(toCString(accelerator));
+		if (result) globalShortcutHandlers.set(accelerator, callback);
 		return result;
 	},
-
-	/**
-	 * Unregister a global keyboard shortcut
-	 * @param accelerator - The shortcut string to unregister
-	 * @returns true if unregistered successfully, false otherwise
-	 */
 	unregister: (accelerator: string): boolean => {
-		const result = native.symbols.unregisterGlobalShortcut(
-			toCString(accelerator),
-		);
-		if (result) {
-			globalShortcutHandlers.delete(accelerator);
-		}
+		if (!native) return false;
+		const result = native_.symbols.unregisterGlobalShortcut(toCString(accelerator));
+		if (result) globalShortcutHandlers.delete(accelerator);
 		return result;
 	},
-
-	/**
-	 * Unregister all global keyboard shortcuts
-	 */
 	unregisterAll: (): void => {
-		native.symbols.unregisterAllGlobalShortcuts();
+		if (native) native_.symbols.unregisterAllGlobalShortcuts();
 		globalShortcutHandlers.clear();
 	},
-
-	/**
-	 * Check if a shortcut is registered
-	 * @param accelerator - The shortcut string to check
-	 * @returns true if registered, false otherwise
-	 */
 	isRegistered: (accelerator: string): boolean => {
-		return native.symbols.isGlobalShortcutRegistered(toCString(accelerator));
+		if (!native) return false;
+		return native_.symbols.isGlobalShortcutRegistered(toCString(accelerator));
 	},
 };
 
@@ -2099,7 +2132,7 @@ export const Screen = {
 	 * @returns Display object for the primary monitor
 	 */
 	getPrimaryDisplay: (): Display => {
-		const jsonStr = native.symbols.getPrimaryDisplay();
+		const jsonStr = native ? native_.symbols.getPrimaryDisplay() : null;
 		if (!jsonStr) {
 			return {
 				id: 0,
@@ -2127,7 +2160,7 @@ export const Screen = {
 	 * @returns Array of Display objects
 	 */
 	getAllDisplays: (): Display[] => {
-		const jsonStr = native.symbols.getAllDisplays();
+		const jsonStr = native ? native_.symbols.getAllDisplays() : null;
 		if (!jsonStr) {
 			return [];
 		}
@@ -2143,7 +2176,7 @@ export const Screen = {
 	 * @returns Point with x and y coordinates
 	 */
 	getCursorScreenPoint: (): Point => {
-		const jsonStr = native.symbols.getCursorScreenPoint();
+		const jsonStr = native ? native_.symbols.getCursorScreenPoint() : null;
 		if (!jsonStr) {
 			return { x: 0, y: 0 };
 		}
@@ -2159,7 +2192,7 @@ export const Screen = {
 	 */
 	getMouseButtons: (): bigint => {
 		try {
-			return native.symbols.getMouseButtons();
+			return native ? native_.symbols.getMouseButtons() : BigInt(0);
 		} catch {
 			return 0n;
 		}
@@ -2211,7 +2244,7 @@ class SessionCookies {
 	 */
 	get(filter?: CookieFilter): Cookie[] {
 		const filterJson = JSON.stringify(filter || {});
-		const result = native.symbols.sessionGetCookies(
+		const result = native_.symbols.sessionGetCookies(
 			toCString(this.partitionId),
 			toCString(filterJson),
 		);
@@ -2230,7 +2263,7 @@ class SessionCookies {
 	 */
 	set(cookie: Cookie): boolean {
 		const cookieJson = JSON.stringify(cookie);
-		return native.symbols.sessionSetCookie(
+		return native_.symbols.sessionSetCookie(
 			toCString(this.partitionId),
 			toCString(cookieJson),
 		);
@@ -2243,7 +2276,7 @@ class SessionCookies {
 	 * @returns true if the cookie was removed successfully
 	 */
 	remove(url: string, name: string): boolean {
-		return native.symbols.sessionRemoveCookie(
+		return native_.symbols.sessionRemoveCookie(
 			toCString(this.partitionId),
 			toCString(url),
 			toCString(name),
@@ -2254,7 +2287,7 @@ class SessionCookies {
 	 * Clear all cookies for this session
 	 */
 	clear(): void {
-		native.symbols.sessionClearCookies(toCString(this.partitionId));
+		native_.symbols.sessionClearCookies(toCString(this.partitionId));
 	}
 }
 
@@ -2274,7 +2307,7 @@ class SessionInstance {
 	 */
 	clearStorageData(types: StorageType[] | "all" = "all"): void {
 		const typesArray = types === "all" ? ["all"] : types;
-		native.symbols.sessionClearStorageData(
+		native_.symbols.sessionClearStorageData(
 			toCString(this.partition),
 			toCString(JSON.stringify(typesArray)),
 		);
@@ -2348,7 +2381,7 @@ const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 			js = `document.querySelector('#electrobun-webview-${id}').emit(${JSON.stringify(eventName)}, ${JSON.stringify(detail)});`;
 		}
 
-		native.symbols.evaluateJavaScriptWithNoCompletion(
+		native_.symbols.evaluateJavaScriptWithNoCompletion(
 			hostWebview.ptr,
 			toCString(js),
 		);
@@ -2754,7 +2787,7 @@ export const internalRpcHandlers = {
 				return false;
 			}
 
-			return native.symbols.webviewCanGoBack(webviewPtr);
+			return native_.symbols.webviewCanGoBack(webviewPtr);
 		},
 		webviewTagCanGoForward: (params: { id: number }) => {
 			const { id } = params;
@@ -2764,7 +2797,7 @@ export const internalRpcHandlers = {
 				return false;
 			}
 
-			return native.symbols.webviewCanGoForward(webviewPtr);
+			return native_.symbols.webviewCanGoForward(webviewPtr);
 		},
 	},
 	message: {
@@ -2785,7 +2818,7 @@ export const internalRpcHandlers = {
 			}
 
 			const { x, y, width, height } = params.frame;
-			native.symbols.resizeWebview(
+			native_.symbols.resizeWebview(
 				webviewPtr,
 				x,
 				y,
@@ -2808,7 +2841,7 @@ export const internalRpcHandlers = {
 			}
 
 			const { x, y, width, height } = params.frame;
-			native.symbols.resizeWebview(
+			native_.symbols.resizeWebview(
 				view.ptr,
 				x,
 				y,
@@ -2825,7 +2858,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.loadURLInWebView(webview.ptr, toCString(params.url));
+			native_.symbols.loadURLInWebView(webview.ptr, toCString(params.url));
 		},
 		webviewTagUpdateHtml: (params: { id: number; html: string }) => {
 			const webview = BrowserView.getById(params.id);
@@ -2837,7 +2870,7 @@ export const internalRpcHandlers = {
 			}
 
 			// Store HTML content in native map for scheme handlers
-			native.symbols.setWebviewHTMLContent(webview.id, toCString(params.html));
+			native_.symbols.setWebviewHTMLContent(webview.id, toCString(params.html));
 
 			webview.loadHTML(params.html);
 			webview.html = params.html;
@@ -2850,7 +2883,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.updatePreloadScriptToWebView(
+			native_.symbols.updatePreloadScriptToWebView(
 				webview.ptr,
 				toCString("electrobun_custom_preload_script"),
 				toCString(params.preload),
@@ -2865,7 +2898,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewGoBack(webview.ptr);
+			native_.symbols.webviewGoBack(webview.ptr);
 		},
 		webviewTagGoForward: (params: { id: number }) => {
 			const webview = BrowserView.getById(params.id);
@@ -2875,7 +2908,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewGoForward(webview.ptr);
+			native_.symbols.webviewGoForward(webview.ptr);
 		},
 		webviewTagReload: (params: { id: number }) => {
 			const webview = BrowserView.getById(params.id);
@@ -2885,7 +2918,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewReload(webview.ptr);
+			native_.symbols.webviewReload(webview.ptr);
 		},
 		webviewTagRemove: (params: { id: number }) => {
 			const webview = BrowserView.getById(params.id);
@@ -2900,10 +2933,10 @@ export const internalRpcHandlers = {
 		startWindowMove: (params: { id: number }) => {
 			const windowPtr = getWindowPtr(params.id);
 			if (!windowPtr) return;
-			native.symbols.startWindowMove(windowPtr);
+			native_.symbols.startWindowMove(windowPtr);
 		},
 		stopWindowMove: (_params: unknown) => {
-			native.symbols.stopWindowMove();
+			native_.symbols.stopWindowMove();
 		},
 		webviewTagSetTransparent: (params: {
 			id: number;
@@ -2916,7 +2949,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewSetTransparent(webview.ptr, params.transparent);
+			native_.symbols.webviewSetTransparent(webview.ptr, params.transparent);
 		},
 		wgpuTagSetTransparent: (params: {
 			id: number;
@@ -2929,7 +2962,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.wgpuViewSetTransparent(view.ptr, params.transparent);
+			native_.symbols.wgpuViewSetTransparent(view.ptr, params.transparent);
 		},
 		webviewTagSetPassthrough: (params: {
 			id: number;
@@ -2942,7 +2975,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewSetPassthrough(
+			native_.symbols.webviewSetPassthrough(
 				webview.ptr,
 				params.enablePassthrough,
 			);
@@ -2955,7 +2988,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.wgpuViewSetPassthrough(view.ptr, params.passthrough);
+			native_.symbols.wgpuViewSetPassthrough(view.ptr, params.passthrough);
 		},
 		webviewTagSetHidden: (params: { id: number; hidden: boolean }) => {
 			const webview = BrowserView.getById(params.id);
@@ -2965,7 +2998,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewSetHidden(webview.ptr, params.hidden);
+			native_.symbols.webviewSetHidden(webview.ptr, params.hidden);
 		},
 		wgpuTagSetHidden: (params: { id: number; hidden: boolean }) => {
 			const view = WGPUView.getById(params.id);
@@ -2975,7 +3008,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.wgpuViewSetHidden(view.ptr, params.hidden);
+			native_.symbols.wgpuViewSetHidden(view.ptr, params.hidden);
 		},
 		wgpuTagRemove: (params: { id: number }) => {
 			const view = WGPUView.getById(params.id);
@@ -2999,7 +3032,7 @@ export const internalRpcHandlers = {
 				console.error("wgpuTagRunTest: wgpuRunGPUTest not available");
 				return;
 			}
-			native.symbols.wgpuRunGPUTest(view.ptr);
+			native_.symbols.wgpuRunGPUTest(view.ptr);
 		},
 		webviewTagSetNavigationRules: (params: { id: number; rules: string[] }) => {
 			const webview = BrowserView.getById(params.id);
@@ -3010,7 +3043,7 @@ export const internalRpcHandlers = {
 				return;
 			}
 			const rulesJson = JSON.stringify(params.rules);
-			native.symbols.setWebviewNavigationRules(
+			native_.symbols.setWebviewNavigationRules(
 				webview.ptr,
 				toCString(rulesJson),
 			);
@@ -3028,7 +3061,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewFindInPage(
+			native_.symbols.webviewFindInPage(
 				webview.ptr,
 				toCString(params.searchText),
 				params.forward,
@@ -3043,7 +3076,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewStopFind(webview.ptr);
+			native_.symbols.webviewStopFind(webview.ptr);
 		},
 		webviewTagOpenDevTools: (params: { id: number }) => {
 			const webview = BrowserView.getById(params.id);
@@ -3053,7 +3086,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewOpenDevTools(webview.ptr);
+			native_.symbols.webviewOpenDevTools(webview.ptr);
 		},
 		webviewTagCloseDevTools: (params: { id: number }) => {
 			const webview = BrowserView.getById(params.id);
@@ -3063,7 +3096,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewCloseDevTools(webview.ptr);
+			native_.symbols.webviewCloseDevTools(webview.ptr);
 		},
 		webviewTagToggleDevTools: (params: { id: number }) => {
 			const webview = BrowserView.getById(params.id);
@@ -3073,7 +3106,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.webviewToggleDevTools(webview.ptr);
+			native_.symbols.webviewToggleDevTools(webview.ptr);
 		},
 		webviewTagExecuteJavascript: (params: { id: number; js: string }) => {
 			const webview = BrowserView.getById(params.id);
@@ -3083,7 +3116,7 @@ export const internalRpcHandlers = {
 				);
 				return;
 			}
-			native.symbols.evaluateJavaScriptWithNoCompletion(
+			native_.symbols.evaluateJavaScriptWithNoCompletion(
 				webview.ptr,
 				toCString(params.js),
 			);
